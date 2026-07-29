@@ -376,7 +376,7 @@ export default function VisualizerApp() {
             </div>
           </div>
 
-          <div className="space-y-5 p-4">
+          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4 pb-8">
             <label className="block">
               <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Search</span>
               <span className="flex h-10 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 shadow-sm focus-within:border-slate-400">
