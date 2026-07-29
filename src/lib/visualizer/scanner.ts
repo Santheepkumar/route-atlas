@@ -43,11 +43,28 @@ export type ScanOptions = {
 const ignoredDirectories = new Set([
   ".git",
   ".next",
+  ".turbo",
   "node_modules",
   "out",
   "build",
   "dist",
   "coverage",
+  "storybook-static",
+  "playwright-report",
+  "test-results",
+  "__tests__",
+]);
+
+const generatedDirectories = new Set([
+  ".next",
+  ".turbo",
+  "out",
+  "build",
+  "dist",
+  "coverage",
+  "storybook-static",
+  "playwright-report",
+  "test-results",
 ]);
 
 const specialHierarchy = ["layout", "template", "error", "loading", "not-found", "page"];
@@ -103,13 +120,14 @@ export async function scanNextApp(options: ScanOptions | string = createScanOpti
     throw new Error("No App Router directory found at src/app or app.");
   }
 
-  const [sourceFiles, assetFiles, nextVersion] = await Promise.all([
-    collectFiles(normalizedRoot, (file) => isSourceFile(file)),
-    collectFiles(normalizedRoot, (file) => isAssetFile(file)),
+  await recordIgnoredGeneratedFolders(normalizedRoot, state);
+  const scanRoots = await collectScanRoots(normalizedRoot, appDir);
+  const [sourceFiles, nextVersion] = await Promise.all([
+    collectFiles(scanRoots, state, (file) => isSourceFile(file) && !isIgnoredSourceFile(file)),
     readNextVersion(normalizedRoot),
   ]);
 
-  buildFileAndRouteNodes(state, sourceFiles, assetFiles);
+  buildFileAndRouteNodes(state, sourceFiles);
   buildRouteStructureEdges(state);
   buildAstEdges(state, sourceFiles);
 
@@ -145,20 +163,7 @@ export async function scanNextApp(options: ScanOptions | string = createScanOpti
   };
 }
 
-function buildFileAndRouteNodes(state: ScanState, sourceFiles: string[], assetFiles: string[]) {
-  for (const filePath of assetFiles) {
-    const repoPath = toRepoPath(state.repoRoot, filePath);
-    addNode(state, {
-      id: `asset:${repoPath}`,
-      kind: "asset",
-      label: path.basename(filePath),
-      file: repoPath,
-      metadata: {
-        extension: path.extname(filePath),
-      },
-    });
-  }
-
+function buildFileAndRouteNodes(state: ScanState, sourceFiles: string[]) {
   for (const filePath of sourceFiles) {
     const repoPath = toRepoPath(state.repoRoot, filePath);
     const specialFile = filePath.startsWith(state.appDir)
@@ -773,7 +778,35 @@ function packageNameFromSpecifier(specifier: string) {
   return specifier.split("/")[0];
 }
 
-async function collectFiles(repoRoot: string, predicate: (file: string) => boolean) {
+async function recordIgnoredGeneratedFolders(repoRoot: string, state: ScanState) {
+  for (const name of generatedDirectories) {
+    const candidate = path.join(/*turbopackIgnore: true*/ repoRoot, name);
+    if (await pathExists(candidate)) {
+      addWarningOnce(state, `Ignored generated folder: ${toRepoPath(state.repoRoot, candidate)}`);
+    }
+  }
+}
+
+async function collectScanRoots(repoRoot: string, appDir: string) {
+  const roots = new Set<string>();
+  const srcDir = path.join(/*turbopackIgnore: true*/ repoRoot, "src");
+
+  roots.add(appDir);
+  if (await pathExists(srcDir)) {
+    roots.add(srcDir);
+  }
+
+  for (const name of ["components", "lib", "utils", "hooks", "data", "services", "features", "modules", "stores", "styles"]) {
+    const candidate = path.join(/*turbopackIgnore: true*/ repoRoot, name);
+    if (await pathExists(candidate)) {
+      roots.add(candidate);
+    }
+  }
+
+  return [...roots];
+}
+
+async function collectFiles(roots: string[], state: ScanState, predicate: (file: string) => boolean) {
   const files: string[] = [];
 
   async function walk(dir: string) {
@@ -787,7 +820,11 @@ async function collectFiles(repoRoot: string, predicate: (file: string) => boole
     for (const entry of entries) {
       const fullPath = path.join(/*turbopackIgnore: true*/ dir, entry.name);
       if (entry.isDirectory()) {
-        if (!ignoredDirectories.has(entry.name)) {
+        if (ignoredDirectories.has(entry.name)) {
+          if (generatedDirectories.has(entry.name)) {
+            addWarningOnce(state, `Ignored generated folder: ${toRepoPath(state.repoRoot, fullPath)}`);
+          }
+        } else {
           await walk(fullPath);
         }
         continue;
@@ -798,8 +835,24 @@ async function collectFiles(repoRoot: string, predicate: (file: string) => boole
     }
   }
 
-  await walk(repoRoot);
+  for (const root of roots) {
+    await walk(root);
+  }
   return files;
+}
+
+function isIgnoredSourceFile(filePath: string) {
+  const baseName = path.basename(filePath).toLowerCase();
+  return (
+    /\.(test|spec|stories)\.[cm]?[jt]sx?$/.test(baseName) ||
+    baseName.endsWith(".d.ts")
+  );
+}
+
+function addWarningOnce(state: ScanState, warning: string) {
+  if (!state.warnings.includes(warning)) {
+    state.warnings.push(warning);
+  }
 }
 
 async function readNextVersion(repoRoot: string) {

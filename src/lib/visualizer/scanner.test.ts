@@ -51,12 +51,26 @@ describe("scanNextApp", () => {
       }
     }
   });
+
+  it("ignores generated folders plus test and story files while preserving imported assets", async () => {
+    const graph = await scanNextApp(fixtureRoot);
+
+    expect(graph.nodes.some((node) => node.file?.startsWith("storybook-static/"))).toBe(false);
+    expect(graph.nodes.some((node) => node.file?.includes("Card.stories.tsx"))).toBe(false);
+    expect(graph.nodes.some((node) => node.file?.includes("Card.test.tsx"))).toBe(false);
+    expect(graph.nodes.some((node) => node.file?.startsWith("coverage/"))).toBe(false);
+    expect(graph.nodes.some((node) => node.id === "asset:src/components/icon.svg")).toBe(true);
+    expect(graph.warnings).toContain("Ignored generated folder: storybook-static");
+    expect(graph.warnings).toContain("Ignored generated folder: coverage");
+  });
 });
 
 async function writeFixture(root: string) {
   await fs.mkdir(path.join(root, "src", "app", "blog", "[slug]"), { recursive: true });
   await fs.mkdir(path.join(root, "src", "app", "api", "posts"), { recursive: true });
   await fs.mkdir(path.join(root, "src", "components"), { recursive: true });
+  await fs.mkdir(path.join(root, "storybook-static", "assets"), { recursive: true });
+  await fs.mkdir(path.join(root, "coverage"), { recursive: true });
 
   await fs.writeFile(
     path.join(root, "package.json"),
@@ -79,8 +93,13 @@ async function writeFixture(root: string) {
   );
   await fs.writeFile(
     path.join(root, "src", "components", "Card.tsx"),
-    "export function Card({ children }: { children: React.ReactNode }) { return <article>{children}</article> }\n",
+    "import icon from './icon.svg'\nexport function Card({ children }: { children: React.ReactNode }) { return <article data-icon={icon}>{children}</article> }\n",
   );
+  await fs.writeFile(path.join(root, "src", "components", "icon.svg"), "<svg />\n");
+  await fs.writeFile(path.join(root, "src", "components", "Card.stories.tsx"), "export default { component: 'Card' }\n");
+  await fs.writeFile(path.join(root, "src", "components", "Card.test.tsx"), "import { Card } from './Card'\n");
+  await fs.writeFile(path.join(root, "storybook-static", "assets", "bundle.js"), "import './chunk.js'; export const generated = true;\n");
+  await fs.writeFile(path.join(root, "coverage", "coverage.js"), "export const generated = true;\n");
   await fs.writeFile(
     path.join(root, "src", "app", "layout.tsx"),
     "export const metadata = { title: 'Fixture' }\nexport default function Layout({ children }: { children: React.ReactNode }) { return <html><body>{children}</body></html> }\n",

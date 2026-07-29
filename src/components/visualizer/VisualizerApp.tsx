@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import {
   Background,
   BaseEdge,
@@ -37,6 +37,8 @@ import {
 import type { GraphEdge, GraphEdgeKind, GraphNode, GraphNodeKind, ScanError, ScanGraph } from "@/lib/visualizer/types";
 
 type Mode = "story" | "routes" | "components" | "data" | "navigation" | "all";
+type LargeGraphMode = "guarded" | "full";
+type LayoutStatus = "idle" | "pending" | "ready" | "failed";
 type VisualNode = FlowNode<VisualNodeData, "visual">;
 type VisualEdge = FlowEdge<VisualEdgeData, "visual">;
 
@@ -52,6 +54,12 @@ type VisualNodeData = {
 
 type VisualEdgeData = {
   graphEdge: GraphEdge;
+  showLabel: boolean;
+};
+
+type GraphIndex = {
+  nodeById: Map<string, GraphNode>;
+  relationshipsByNode: Map<string, GraphEdge[]>;
 };
 
 const elk = new ELK({
@@ -107,6 +115,19 @@ const expansionEdgeKinds = new Set<GraphEdgeKind>([
   "dynamic-param",
 ]);
 
+const allGuardedEdgeKinds = new Set<GraphEdgeKind>([
+  ...storyEdgeKinds,
+  "fetch-call",
+  "server-action",
+  "metadata",
+  "dynamic-param",
+]);
+
+const LARGE_GRAPH_NODE_THRESHOLD = 180;
+const LARGE_GRAPH_EDGE_THRESHOLD = 420;
+const HIDE_LABEL_EDGE_THRESHOLD = 180;
+const HIDE_MINIMAP_NODE_THRESHOLD = 260;
+
 const edgeKindsByMode: Record<Exclude<Mode, "story" | "all">, Set<GraphEdgeKind>> = {
   routes: new Set(["route-nesting", "route-owns-file", "layout-wraps", "parallel-slot", "intercepts", "route-handler"]),
   components: new Set(["imports", "component-use"]),
@@ -159,9 +180,14 @@ export default function VisualizerApp() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [mode, setMode] = useState<Mode>("story");
+  const [largeGraphMode, setLargeGraphMode] = useState<LargeGraphMode>("guarded");
+  const [layoutStatus, setLayoutStatus] = useState<LayoutStatus>("idle");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [laidOutNodes, setLaidOutNodes] = useState<VisualNode[]>([]);
+  const [isPending, startTransition] = useTransition();
+  const deferredQuery = useDeferredValue(query);
+  const layoutCache = useRef(new Map<string, VisualNode[]>());
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -173,8 +199,10 @@ export default function VisualizerApp() {
         throw new Error("error" in payload ? payload.details ?? payload.error : "Scan failed.");
       }
       setGraph(payload);
+      layoutCache.current.clear();
       setSelectedId(null);
       setMode("story");
+      setLargeGraphMode("guarded");
     } catch (scanError) {
       setError(scanError instanceof Error ? scanError.message : "Scan failed.");
     } finally {
@@ -189,10 +217,18 @@ export default function VisualizerApp() {
     return () => window.clearTimeout(timer);
   }, [refresh]);
 
-  const selectedNode = graph?.nodes.find((node) => node.id === selectedId) ?? null;
-  const selectedEdges = selectedId && graph ? graph.edges.filter((edge) => edge.source === selectedId || edge.target === selectedId) : [];
+  const graphIndex = useMemo(() => buildGraphIndex(graph), [graph]);
+  const selectedNode = selectedId ? graphIndex.nodeById.get(selectedId) ?? null : null;
+  const selectedEdges = selectedId ? graphIndex.relationshipsByNode.get(selectedId) ?? [] : [];
 
-  const visibleGraph = useMemo(() => deriveVisibleGraph(graph, mode, query, selectedId), [graph, mode, query, selectedId]);
+  const visibleGraph = useMemo(
+    () => deriveVisibleGraph(graph, mode, deferredQuery, selectedId, largeGraphMode),
+    [graph, mode, deferredQuery, selectedId, largeGraphMode],
+  );
+  const graphIsLarge = visibleGraph.nodes.length > LARGE_GRAPH_NODE_THRESHOLD || visibleGraph.edges.length > LARGE_GRAPH_EDGE_THRESHOLD;
+  const showEdgeLabels = visibleGraph.edges.length <= HIDE_LABEL_EDGE_THRESHOLD;
+  const showMiniMap = visibleGraph.nodes.length <= HIDE_MINIMAP_NODE_THRESHOLD;
+  const graphWorkPending = loading || isPending || layoutStatus === "pending" || query !== deferredQuery;
 
   const flowEdges = useMemo<VisualEdge[]>(
     () =>
@@ -201,11 +237,11 @@ export default function VisualizerApp() {
         type: "visual",
         source: edge.source,
         target: edge.target,
-        label: edge.label,
-        animated: edge.confidence === "inferred",
-        data: { graphEdge: edge },
+        label: showEdgeLabels ? edge.label : undefined,
+        animated: edge.confidence === "inferred" && !graphIsLarge,
+        data: { graphEdge: edge, showLabel: showEdgeLabels },
       })),
-    [visibleGraph.edges],
+    [graphIsLarge, showEdgeLabels, visibleGraph.edges],
   );
 
   const flowNodes = useMemo<VisualNode[]>(
@@ -232,8 +268,25 @@ export default function VisualizerApp() {
     async function layoutVisibleGraph() {
       if (!flowNodes.length) {
         setLaidOutNodes([]);
+        setLayoutStatus(graph ? "ready" : "idle");
         return;
       }
+      const cacheKey = [
+        graph?.generatedAt,
+        mode,
+        largeGraphMode,
+        deferredQuery,
+        selectedId ?? "",
+        flowNodes.map((node) => node.id).join("|"),
+        flowEdges.map((edge) => edge.id).join("|"),
+      ].join("::");
+      const cached = layoutCache.current.get(cacheKey);
+      if (cached) {
+        setLaidOutNodes(cached);
+        setLayoutStatus("ready");
+        return;
+      }
+      setLayoutStatus("pending");
       const graphToLayout: ElkNode = {
         id: "root",
         children: flowNodes.map((node) => ({
@@ -248,19 +301,21 @@ export default function VisualizerApp() {
         const layout = await elk.layout(graphToLayout);
         const positions = new Map((layout.children ?? []).map((node) => [node.id, node]));
         if (!cancelled) {
-          setLaidOutNodes(
-            flowNodes.map((node) => {
+          const nextNodes = flowNodes.map((node) => {
               const position = positions.get(node.id);
               return {
                 ...node,
                 position: { x: position?.x ?? 0, y: position?.y ?? 0 },
               };
-            }),
-          );
+            });
+          layoutCache.current.set(cacheKey, nextNodes);
+          setLaidOutNodes(nextNodes);
+          setLayoutStatus("ready");
         }
       } catch {
         if (!cancelled) {
           setLaidOutNodes(flowNodes);
+          setLayoutStatus("failed");
         }
       }
     }
@@ -269,7 +324,28 @@ export default function VisualizerApp() {
     return () => {
       cancelled = true;
     };
-  }, [flowEdges, flowNodes]);
+  }, [deferredQuery, flowEdges, flowNodes, graph, largeGraphMode, mode, selectedId]);
+
+  const changeMode = (nextMode: Mode) => {
+    startTransition(() => {
+      setMode(nextMode);
+      if (nextMode !== "all") {
+        setLargeGraphMode("guarded");
+      }
+    });
+  };
+
+  const selectNode = (nodeId: string | null) => {
+    startTransition(() => {
+      setSelectedId(nodeId);
+    });
+  };
+
+  const showFullGraph = () => {
+    startTransition(() => {
+      setLargeGraphMode("full");
+    });
+  };
 
   const downloadJson = () => {
     if (!graph) {
@@ -324,7 +400,7 @@ export default function VisualizerApp() {
                     <button
                       key={option.id}
                       type="button"
-                      onClick={() => setMode(option.id)}
+                      onClick={() => changeMode(option.id)}
                       className={`flex h-10 items-center gap-2 rounded-md border px-3 text-left text-sm font-medium transition ${
                         active
                           ? "border-slate-950 bg-slate-950 text-white shadow-sm"
@@ -382,6 +458,11 @@ export default function VisualizerApp() {
                   ? `${graph.framework.name} ${graph.framework.version} · ${visibleGraph.nodes.length} visible nodes · ${visibleGraph.edges.length} visible edges`
                   : "Building the map"}
               </div>
+              {visibleGraph.hiddenNodeCount || visibleGraph.hiddenEdgeCount ? (
+                <div className="mt-1 text-xs text-slate-400">
+                  {visibleGraph.hiddenNodeCount} deep nodes hidden · {visibleGraph.hiddenEdgeCount} edges hidden
+                </div>
+              ) : null}
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -425,20 +506,46 @@ export default function VisualizerApp() {
                 fitViewOptions={{ padding: 0.28 }}
                 minZoom={0.08}
                 maxZoom={1.8}
-                onNodeClick={(_, node) => setSelectedId(node.id)}
-                onPaneClick={() => setSelectedId(null)}
+                onNodeClick={(_, node) => selectNode(node.id)}
+                onPaneClick={() => selectNode(null)}
+                onlyRenderVisibleElements
                 proOptions={{ hideAttribution: true }}
               >
                 <Background color="#cbd5e1" gap={20} />
-                <MiniMap
-                  pannable
-                  zoomable
-                  nodeColor={(node) => nodePalette[(node.data as VisualNodeData).kind].border}
-                  maskColor="rgba(15, 23, 42, 0.08)"
-                />
+                {showMiniMap ? (
+                  <MiniMap
+                    pannable
+                    zoomable
+                    nodeColor={(node) => nodePalette[(node.data as VisualNodeData).kind].border}
+                    maskColor="rgba(15, 23, 42, 0.08)"
+                  />
+                ) : null}
                 <Controls />
               </ReactFlow>
             )}
+            {mode === "all" && largeGraphMode === "guarded" && graph && !error ? (
+              <div className="absolute left-4 top-4 max-w-sm rounded-md border border-slate-200 bg-white/95 p-3 text-xs text-slate-600 shadow-sm backdrop-blur">
+                <div className="font-semibold text-slate-900">Guarded All</div>
+                <div className="mt-1">
+                  Showing architecture relationships first. {visibleGraph.hiddenNodeCount} deep nodes and {visibleGraph.hiddenEdgeCount} edges are hidden.
+                </div>
+                <button
+                  type="button"
+                  onClick={showFullGraph}
+                  className="mt-3 rounded-md border border-slate-300 px-3 py-1.5 text-xs font-semibold text-slate-800 hover:border-slate-500"
+                >
+                  Show full deep graph
+                </button>
+              </div>
+            ) : null}
+            {graphWorkPending && !error ? (
+              <div className="absolute inset-0 grid place-items-center bg-[#eef2f6]/70 backdrop-blur-[1px]">
+                <div className="flex items-center gap-2 rounded-md border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 shadow-sm">
+                  <LoaderCircle size={17} className="animate-spin" />
+                  {loading ? "Scanning project" : "Preparing map"}
+                </div>
+              </div>
+            ) : null}
           </section>
         </main>
 
@@ -451,7 +558,7 @@ export default function VisualizerApp() {
           </div>
           <div className="min-h-0 flex-1 overflow-auto p-4">
             {selectedNode ? (
-              <Inspector node={selectedNode} edges={selectedEdges} />
+              <Inspector node={selectedNode} edges={selectedEdges} nodeById={graphIndex.nodeById} />
             ) : (
               <div className="space-y-3 text-sm leading-6 text-slate-500">
                 <p>Select a route to unfold its components, imports, data calls, metadata, and params.</p>
@@ -465,9 +572,35 @@ export default function VisualizerApp() {
   );
 }
 
-function deriveVisibleGraph(graph: ScanGraph | null, mode: Mode, query: string, selectedId: string | null) {
+function buildGraphIndex(graph: ScanGraph | null): GraphIndex {
+  const nodeById = new Map<string, GraphNode>();
+  const relationshipsByNode = new Map<string, GraphEdge[]>();
   if (!graph) {
-    return { nodes: [] as GraphNode[], edges: [] as GraphEdge[], quietNodeIds: new Set<string>() };
+    return { nodeById, relationshipsByNode };
+  }
+  for (const node of graph.nodes) {
+    nodeById.set(node.id, node);
+  }
+  for (const edge of graph.edges) {
+    const sourceEdges = relationshipsByNode.get(edge.source) ?? [];
+    sourceEdges.push(edge);
+    relationshipsByNode.set(edge.source, sourceEdges);
+    const targetEdges = relationshipsByNode.get(edge.target) ?? [];
+    targetEdges.push(edge);
+    relationshipsByNode.set(edge.target, targetEdges);
+  }
+  return { nodeById, relationshipsByNode };
+}
+
+function deriveVisibleGraph(
+  graph: ScanGraph | null,
+  mode: Mode,
+  query: string,
+  selectedId: string | null,
+  largeGraphMode: LargeGraphMode,
+) {
+  if (!graph) {
+    return { nodes: [] as GraphNode[], edges: [] as GraphEdge[], quietNodeIds: new Set<string>(), hiddenNodeCount: 0, hiddenEdgeCount: 0 };
   }
 
   const normalizedQuery = query.trim().toLowerCase();
@@ -483,6 +616,8 @@ function deriveVisibleGraph(graph: ScanGraph | null, mode: Mode, query: string, 
   let candidateEdges: GraphEdge[];
   if (mode === "story") {
     candidateEdges = graph.edges.filter((edge) => storyEdgeKinds.has(edge.kind) || expansionEdges.includes(edge));
+  } else if (mode === "all" && largeGraphMode === "guarded") {
+    candidateEdges = graph.edges.filter((edge) => allGuardedEdgeKinds.has(edge.kind) || expansionEdges.includes(edge));
   } else if (mode === "all") {
     candidateEdges = graph.edges;
   } else {
@@ -512,6 +647,9 @@ function deriveVisibleGraph(graph: ScanGraph | null, mode: Mode, query: string, 
     if (mode === "navigation") {
       return routeNodeKinds.has(node.kind) || connectedNodeIds.has(node.id);
     }
+    if (mode === "all" && largeGraphMode === "guarded") {
+      return routeNodeKinds.has(node.kind) || selectedNeighborhood.has(node.id) || connectedNodeIds.has(node.id);
+    }
     return true;
   };
 
@@ -530,7 +668,7 @@ function deriveVisibleGraph(graph: ScanGraph | null, mode: Mode, query: string, 
   const nodeIds = new Set(nodes.map((node) => node.id));
   const edges = candidateEdges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
   const quietNodeIds = new Set<string>();
-  if (mode === "story") {
+  if (mode === "story" || (mode === "all" && largeGraphMode === "guarded")) {
     for (const node of nodes) {
       if (!routeNodeKinds.has(node.kind) && !selectedNeighborhood.has(node.id)) {
         quietNodeIds.add(node.id);
@@ -538,7 +676,26 @@ function deriveVisibleGraph(graph: ScanGraph | null, mode: Mode, query: string, 
     }
   }
 
-  return { nodes, edges, quietNodeIds };
+  let hiddenNodeCount = 0;
+  let hiddenEdgeCount = 0;
+  if (mode === "all" && largeGraphMode === "guarded") {
+    const fullNodes = graph.nodes.filter((node) => matchesQuery(node, normalizedQuery));
+    const fullNodeIds = new Set(fullNodes.map((node) => node.id));
+    const fullEdges = graph.edges.filter((edge) => fullNodeIds.has(edge.source) && fullNodeIds.has(edge.target));
+    hiddenNodeCount = Math.max(0, fullNodes.length - nodes.length);
+    hiddenEdgeCount = Math.max(0, fullEdges.length - edges.length);
+  }
+
+  return { nodes, edges, quietNodeIds, hiddenNodeCount, hiddenEdgeCount };
+}
+
+function matchesQuery(node: GraphNode, normalizedQuery: string) {
+  if (!normalizedQuery) {
+    return true;
+  }
+  return [node.label, node.route, node.file, node.kind, node.specialFile]
+    .filter(Boolean)
+    .some((value) => String(value).toLowerCase().includes(normalizedQuery));
 }
 
 function IdeNode({ data, selected }: NodeProps<VisualNode>) {
@@ -659,7 +816,7 @@ function Legend() {
   );
 }
 
-function Inspector({ node, edges }: { node: GraphNode; edges: GraphEdge[] }) {
+function Inspector({ node, edges, nodeById }: { node: GraphNode; edges: GraphEdge[]; nodeById: Map<string, GraphNode> }) {
   const incoming = edges.filter((edge) => edge.target === node.id);
   const outgoing = edges.filter((edge) => edge.source === node.id);
 
@@ -687,8 +844,8 @@ function Inspector({ node, edges }: { node: GraphNode; edges: GraphEdge[] }) {
 
       <section>
         <SectionTitle>Relationships</SectionTitle>
-        <RelationshipList title="Outgoing" edges={outgoing} empty="No outgoing relationships." />
-        <RelationshipList title="Incoming" edges={incoming} empty="No incoming relationships." />
+        <RelationshipList title="Outgoing" edges={outgoing} empty="No outgoing relationships." nodeById={nodeById} direction="outgoing" />
+        <RelationshipList title="Incoming" edges={incoming} empty="No incoming relationships." nodeById={nodeById} direction="incoming" />
       </section>
 
       <section>
@@ -701,24 +858,95 @@ function Inspector({ node, edges }: { node: GraphNode; edges: GraphEdge[] }) {
   );
 }
 
-function RelationshipList({ title, edges, empty }: { title: string; edges: GraphEdge[]; empty: string }) {
+function RelationshipList({
+  title,
+  edges,
+  empty,
+  nodeById,
+  direction,
+}: {
+  title: string;
+  edges: GraphEdge[];
+  empty: string;
+  nodeById: Map<string, GraphNode>;
+  direction: "incoming" | "outgoing";
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const groups = useMemo(() => groupRelationships(edges, direction, nodeById), [direction, edges, nodeById]);
+  const visibleGroups = expanded ? groups : groups.slice(0, 8);
+  const hiddenCount = Math.max(0, groups.length - visibleGroups.length);
+
   return (
     <div className="mb-3">
       <div className="mb-1 text-xs font-semibold text-slate-500">{title}</div>
       <div className="space-y-2">
-        {edges.length ? (
-          edges.slice(0, 16).map((edge) => (
-            <div key={edge.id} className="rounded-md border border-slate-200 bg-white p-2 text-xs shadow-sm">
-              <div className="font-semibold text-slate-700">{edge.kind}</div>
-              <div className="mt-1 break-words text-slate-500">{title === "Outgoing" ? edge.target : edge.source}</div>
-            </div>
-          ))
+        {groups.length ? (
+          <>
+            {visibleGroups.map((group) => (
+              <div key={group.key} className="rounded-md border border-slate-200 bg-white p-2 text-xs shadow-sm">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="font-semibold text-slate-700">{group.kind}</div>
+                  <div className="rounded-sm bg-slate-100 px-1.5 py-0.5 font-semibold text-slate-500">{group.count}</div>
+                </div>
+                <div className="mt-1 break-words text-slate-500">{group.peerGroup}</div>
+                {group.samples.length ? <div className="mt-1 truncate text-[11px] text-slate-400">{group.samples.join(" · ")}</div> : null}
+              </div>
+            ))}
+            {hiddenCount ? (
+              <button
+                type="button"
+                onClick={() => setExpanded(true)}
+                className="w-full rounded-md border border-slate-200 bg-slate-50 p-2 text-xs font-semibold text-slate-600 hover:border-slate-300"
+              >
+                Show {hiddenCount} more groups
+              </button>
+            ) : null}
+          </>
         ) : (
           <div className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs text-slate-500">{empty}</div>
         )}
       </div>
     </div>
   );
+}
+
+function groupRelationships(edges: GraphEdge[], direction: "incoming" | "outgoing", nodeById: Map<string, GraphNode>) {
+  const groups = new Map<string, { key: string; kind: GraphEdgeKind; peerGroup: string; count: number; samples: string[] }>();
+  for (const edge of edges) {
+    const peerId = direction === "outgoing" ? edge.target : edge.source;
+    const peer = nodeById.get(peerId);
+    const peerLabel = relationshipPeerLabel(peerId, peer);
+    const peerGroup = relationshipPeerGroup(peerLabel);
+    const key = `${edge.kind}:${peerGroup}`;
+    const group = groups.get(key) ?? {
+      key,
+      kind: edge.kind,
+      peerGroup,
+      count: 0,
+      samples: [],
+    };
+    group.count += 1;
+    if (group.samples.length < 3 && !group.samples.includes(peerLabel)) {
+      group.samples.push(peerLabel);
+    }
+    groups.set(key, group);
+  }
+  return [...groups.values()].sort((a, b) => b.count - a.count || a.kind.localeCompare(b.kind));
+}
+
+function relationshipPeerLabel(peerId: string, node?: GraphNode) {
+  return node?.route ?? node?.file ?? node?.label ?? peerId;
+}
+
+function relationshipPeerGroup(peerLabel: string) {
+  const parts = peerLabel.split("/").filter(Boolean);
+  if (parts.length >= 3) {
+    return `${parts.slice(0, 3).join("/")}/...`;
+  }
+  if (parts.length) {
+    return parts.join("/");
+  }
+  return peerLabel;
 }
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
