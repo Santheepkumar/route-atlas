@@ -46,3 +46,11 @@ PAGE_VISUALS_TARGET_ROOT=/absolute/path/to/next-app pnpm dev --port 3133
 - Pages Router support is not implemented yet.
 - The tool is local-only: no accounts, cloud storage, GitHub auth, or database.
 - Static analysis is intentionally honest: exact relationships are marked static, and guessed relationships are marked inferred.
+
+## Documentation
+
+- [Usage Guide](./docs/usage.md)
+- [Publishing Guide](./docs/publishing.md)
+- [Project Architecture](./docs/architecture.md)
+- [CLI and API Reference](./docs/cli-and-api.md)
+- [Development Guide](./docs/development.md)

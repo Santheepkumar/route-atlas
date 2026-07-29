@@ -31,6 +31,7 @@
     "src/lib/visualizer/route-utils.ts",
     "src/lib/visualizer/types.ts",
     "public",
+    "docs",
     "next.config.ts",
     "postcss.config.mjs",
     "tsconfig.json",
