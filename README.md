@@ -1,36 +1,48 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Route Atlas
 
-## Getting Started
+Route Atlas is a local Next.js App Router visualizer. It scans routes, layouts, pages, route handlers, components, imports, navigation links, data calls, metadata, and dynamic params, then renders them as an interactive graph.
 
-First, run the development server:
+## Use In Any Next.js Project
+
+From a Next.js App Router project:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npx route-atlas
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open the printed local URL. By default, the visualizer runs on `127.0.0.1:3133` and scans the directory where you ran the command.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+You can also point it at another project:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npx route-atlas ./some-next-app
+npx route-atlas ./some-next-app --port 4000
+```
 
-## Learn More
+## Export Scan JSON
 
-To learn more about Next.js, take a look at the following resources:
+```bash
+npx route-atlas scan ./some-next-app --out route-atlas.scan.json
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Without `--out`, the scan JSON is printed to stdout.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Local Development
 
-## Deploy on Vercel
+```bash
+pnpm install
+pnpm dev
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+The app scans its own repo unless `PAGE_VISUALS_TARGET_ROOT` is set:
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+PAGE_VISUALS_TARGET_ROOT=/absolute/path/to/next-app pnpm dev --port 3133
+```
+
+## Current Limitations
+
+- App Router is the primary target.
+- Pages Router support is not implemented yet.
+- The tool is local-only: no accounts, cloud storage, GitHub auth, or database.
+- Static analysis is intentionally honest: exact relationships are marked static, and guessed relationships are marked inferred.
