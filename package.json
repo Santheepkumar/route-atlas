@@ -21,7 +21,7 @@
     "developer-tools"
   ],
   "bin": {
-    "route-atlas": "./bin/route-atlas.mjs"
+    "route-atlas": "bin/route-atlas.mjs"
   },
   "files": [
     "bin/route-atlas.mjs",
