@@ -4,15 +4,12 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
-import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 3133;
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const require = createRequire(import.meta.url);
 
 export function parseCliArgs(argv) {
   const args = [...argv];
@@ -113,7 +110,7 @@ export async function main(argv = process.argv.slice(2)) {
 }
 
 async function runVisualizer({ targetRoot, host, port }) {
-  const child = startNext({ targetRoot, host, port, stdio: "inherit", scanMode: "external" });
+  const child = startProductionServer({ targetRoot, host, port, stdio: "inherit", scanMode: "external" });
   console.log(`\nRoute Atlas scanning: ${targetRoot}`);
   console.log(`Open http://${host}:${port}\n`);
   forwardSignals(child);
@@ -126,7 +123,7 @@ async function runVisualizer({ targetRoot, host, port }) {
 }
 
 async function runJsonScan({ targetRoot, host, port, out }) {
-  const child = startNext({ targetRoot, host, port, stdio: "pipe", scanMode: "json" });
+  const child = startProductionServer({ targetRoot, host, port, stdio: "pipe", scanMode: "json" });
   let logs = "";
   child.stdout?.on("data", (chunk) => {
     logs += String(chunk);
@@ -150,20 +147,25 @@ async function runJsonScan({ targetRoot, host, port, out }) {
   } finally {
     child.kill("SIGTERM");
     await waitForExit(child, 2000);
-    cleanupRuntime(child);
   }
 }
 
-function startNext({ targetRoot, host, port, stdio, scanMode }) {
-  const nextBin = require.resolve("next/dist/bin/next");
-  const runtimeRoot = createRuntimeAppRoot();
+function startProductionServer({ targetRoot, host, port, stdio, scanMode }) {
+  const standaloneRoot = path.join(packageRoot, ".next", "standalone");
+  const serverEntry = path.join(standaloneRoot, "server.js");
+  if (!fs.existsSync(serverEntry)) {
+    throw new Error("Route Atlas production bundle is missing. Run `pnpm build` before using the local CLI, or reinstall the npm package.");
+  }
+  ensureStandaloneAliases(standaloneRoot);
   const child = spawn(
     process.execPath,
-    [nextBin, "dev", runtimeRoot, "--webpack", "--hostname", host, "--port", String(port)],
+    [serverEntry],
     {
-      cwd: runtimeRoot,
+      cwd: standaloneRoot,
       env: {
         ...process.env,
+        HOSTNAME: host,
+        NODE_ENV: "production",
         PAGE_VISUALS_TARGET_ROOT: targetRoot,
         PAGE_VISUALS_PORT: String(port),
         PAGE_VISUALS_SCAN_MODE: scanMode,
@@ -172,28 +174,98 @@ function startNext({ targetRoot, host, port, stdio, scanMode }) {
       stdio,
     },
   );
-  child.routeAtlasRuntimeRoot = runtimeRoot;
   return child;
 }
 
-export function createRuntimeAppRoot(root = packageRoot) {
-  const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "route-atlas-app-"));
-  for (const entry of ["package.json", "next.config.ts", "postcss.config.mjs", "tsconfig.json", "src", "public"]) {
-    const source = path.join(root, entry);
-    if (fs.existsSync(source)) {
-      fs.cpSync(source, path.join(runtimeRoot, entry), { recursive: true });
+export function ensureStandaloneAliases(standaloneRoot) {
+  const aliases = findStandaloneExternalAliases(standaloneRoot);
+  if (!aliases.size) {
+    return;
+  }
+
+  const aliasRoot = path.join(standaloneRoot, ".next", "node_modules");
+  fs.mkdirSync(aliasRoot, { recursive: true });
+  for (const alias of aliases) {
+    const packageName = packageNameFromHashedAlias(alias);
+    if (!packageName) {
+      continue;
+    }
+    const target = resolveStandalonePackageDirectory(standaloneRoot, packageName);
+    const link = path.join(aliasRoot, alias);
+    if (!target || fs.existsSync(link)) {
+      continue;
+    }
+    try {
+      fs.symlinkSync(path.relative(aliasRoot, target), link, "dir");
+    } catch {
+      fs.cpSync(target, link, { recursive: true });
     }
   }
-  fs.symlinkSync(resolveDependencyRoot(), path.join(runtimeRoot, "node_modules"), process.platform === "win32" ? "junction" : "dir");
-  return runtimeRoot;
 }
 
-function resolveDependencyRoot() {
-  const localNodeModules = path.join(packageRoot, "node_modules");
-  if (fs.existsSync(localNodeModules)) {
-    return localNodeModules;
+function resolveStandalonePackageDirectory(standaloneRoot, packageName) {
+  const direct = path.join(standaloneRoot, "node_modules", packageName);
+  if (fs.existsSync(direct)) {
+    return direct;
   }
-  return path.dirname(path.dirname(require.resolve("next/package.json")));
+
+  const pnpmRoot = path.join(standaloneRoot, "node_modules", ".pnpm");
+  let entries;
+  try {
+    entries = fs.readdirSync(pnpmRoot, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const candidate = path.join(pnpmRoot, entry.name, "node_modules", packageName);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+function findStandaloneExternalAliases(standaloneRoot) {
+  const aliases = new Set();
+  const serverRoot = path.join(standaloneRoot, ".next", "server");
+  const aliasPattern = /(?<!node_modules\/)([a-zA-Z0-9_@/.-]+-[a-f0-9]{8,})/g;
+
+  function walk(dir) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(fullPath);
+        continue;
+      }
+      if (!entry.isFile() || !/\.[cm]?js$/.test(entry.name)) {
+        continue;
+      }
+      const text = fs.readFileSync(fullPath, "utf8");
+      for (const match of text.matchAll(aliasPattern)) {
+        const alias = match[1];
+        if (!alias.includes("/")) {
+          aliases.add(alias);
+        }
+      }
+    }
+  }
+
+  walk(serverRoot);
+  return aliases;
+}
+
+function packageNameFromHashedAlias(alias) {
+  const match = /^(.*)-[a-f0-9]{8,}$/.exec(alias);
+  return match?.[1];
 }
 
 async function waitForScanJson(host, port) {
@@ -310,18 +382,6 @@ function waitForExit(child, timeoutMs) {
     }
     child.once("exit", onExit);
   });
-}
-
-function cleanupRuntime(child) {
-  if (!child.routeAtlasRuntimeRoot) {
-    return;
-  }
-  try {
-    fs.rmSync(child.routeAtlasRuntimeRoot, { force: true, recursive: true });
-  } catch {
-    // Temporary runtime cleanup should not mask the CLI's real result.
-  }
-  child.routeAtlasRuntimeRoot = undefined;
 }
 
 function delay(ms) {

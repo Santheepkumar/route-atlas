@@ -30,7 +30,7 @@ pnpm build
 npm pack --dry-run
 ```
 
-The build currently succeeds with a Turbopack filesystem tracing warning. That warning is expected because Route Atlas intentionally scans arbitrary local project paths.
+`pnpm build` creates the standalone production server and copies static assets into `.next/standalone` for npm packaging. The build currently succeeds with a Turbopack filesystem tracing warning. That warning is expected because Route Atlas intentionally scans arbitrary local project paths.
 
 ## Publish Version `0.1.0`
 

@@ -15,7 +15,7 @@ The CLI:
 - Parses commands and flags using Node built-ins.
 - Resolves and validates the target project path.
 - Finds an available local port.
-- Starts the bundled Next.js visualizer shell.
+- Starts the bundled standalone production server from `.next/standalone/server.js`.
 - Passes the target project through `PAGE_VISUALS_TARGET_ROOT`.
 - Supports JSON-only scans by starting the API briefly, reading `/api/scan`, writing JSON, and shutting down.
 
@@ -74,7 +74,7 @@ The UI:
 ```text
 route-atlas CLI
   -> validates target project
-  -> starts bundled Next app
+  -> starts bundled standalone production server
   -> sets PAGE_VISUALS_TARGET_ROOT
   -> browser loads UI
   -> UI calls GET /api/scan

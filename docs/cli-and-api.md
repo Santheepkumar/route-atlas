@@ -32,6 +32,8 @@ Print JSON:
 route-atlas scan ./some-next-app
 ```
 
+The published CLI starts Route Atlas from its prebuilt standalone production bundle. It scans the target directory from disk; it does not run the target app's Next.js server.
+
 Show help/version:
 
 ```bash

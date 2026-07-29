@@ -12,6 +12,8 @@ npx route-atlas
 
 Open the printed local URL. By default, the visualizer runs on `127.0.0.1:3133` and scans the directory where you ran the command.
 
+The npm CLI serves Route Atlas from its bundled production build, so it does not start your target app or show Next.js development tooling.
+
 You can also point it at another project:
 
 ```bash
@@ -34,7 +36,7 @@ pnpm install
 pnpm dev
 ```
 
-The app scans its own repo unless `PAGE_VISUALS_TARGET_ROOT` is set:
+Development mode is only for working on Route Atlas itself. The app scans its own repo unless `PAGE_VISUALS_TARGET_ROOT` is set:
 
 ```bash
 PAGE_VISUALS_TARGET_ROOT=/absolute/path/to/next-app pnpm dev --port 3133

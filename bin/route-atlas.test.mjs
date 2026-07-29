@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { fileURLToPath } from "node:url";
-import { isDirectCliInvocation, parseCliArgs, resolveTargetRoot } from "./route-atlas.mjs";
+import { ensureStandaloneAliases, isDirectCliInvocation, parseCliArgs, resolveTargetRoot } from "./route-atlas.mjs";
 
 let fixtureRoot;
 
@@ -61,5 +61,21 @@ describe("route-atlas CLI", () => {
     await fs.symlink(fileURLToPath(new URL("./route-atlas.mjs", import.meta.url)), linkPath);
 
     expect(isDirectCliInvocation(linkPath)).toBe(true);
+  });
+
+  it("recreates standalone hashed module aliases", async () => {
+    const standaloneRoot = path.join(fixtureRoot, "standalone");
+    await fs.mkdir(path.join(standaloneRoot, ".next", "server", "chunks"), { recursive: true });
+    await fs.mkdir(path.join(standaloneRoot, "node_modules", ".pnpm", "ts-morph@28.0.0", "node_modules", "ts-morph"), { recursive: true });
+    await fs.writeFile(path.join(standaloneRoot, "node_modules", ".pnpm", "ts-morph@28.0.0", "node_modules", "ts-morph", "package.json"), "{}");
+    await fs.writeFile(
+      path.join(standaloneRoot, ".next", "server", "chunks", "route.js"),
+      "module.exports = require('ts-morph-4eab3a138cf3b17c')",
+    );
+
+    ensureStandaloneAliases(standaloneRoot);
+
+    const aliasPath = path.join(standaloneRoot, ".next", "node_modules", "ts-morph-4eab3a138cf3b17c");
+    expect(await fs.stat(aliasPath)).toBeTruthy();
   });
 });
