@@ -3,11 +3,28 @@
   "version": "0.1.0",
   "private": false,
   "description": "Local Next.js App Router atlas for routes, layouts, components, navigation, and data flow.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Santheepkumar/route-atlas.git"
+  },
+  "homepage": "https://github.com/Santheepkumar/route-atlas#readme",
+  "bugs": {
+    "url": "https://github.com/Santheepkumar/route-atlas/issues"
+  },
+  "keywords": [
+    "nextjs",
+    "next",
+    "app-router",
+    "routes",
+    "visualizer",
+    "react-flow",
+    "developer-tools"
+  ],
   "bin": {
     "route-atlas": "./bin/route-atlas.mjs"
   },
   "files": [
-    "bin",
+    "bin/route-atlas.mjs",
     "src/app",
     "src/components",
     "src/lib/visualizer/scanner.ts",

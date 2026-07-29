@@ -5,11 +5,13 @@ import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 3133;
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const require = createRequire(import.meta.url);
 
 export function parseCliArgs(argv) {
   const args = [...argv];
@@ -146,7 +148,7 @@ async function runJsonScan({ targetRoot, host, port, out }) {
 }
 
 function startNext({ targetRoot, host, port, stdio, scanMode }) {
-  const nextBin = path.join(packageRoot, "node_modules", "next", "dist", "bin", "next");
+  const nextBin = require.resolve("next/dist/bin/next");
   const child = spawn(
     process.execPath,
     [nextBin, "dev", packageRoot, "--hostname", host, "--port", String(port)],
