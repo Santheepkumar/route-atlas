@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { parseCliArgs, resolveTargetRoot } from "./route-atlas.mjs";
+import { fileURLToPath } from "node:url";
+import { isDirectCliInvocation, parseCliArgs, resolveTargetRoot } from "./route-atlas.mjs";
 
 let fixtureRoot;
 
@@ -53,5 +54,12 @@ describe("route-atlas CLI", () => {
     } finally {
       await fs.rm(emptyRoot, { force: true, recursive: true });
     }
+  });
+
+  it("detects direct invocation through a symlinked npm bin", async () => {
+    const linkPath = path.join(fixtureRoot, "route-atlas");
+    await fs.symlink(fileURLToPath(new URL("./route-atlas.mjs", import.meta.url)), linkPath);
+
+    expect(isDirectCliInvocation(linkPath)).toBe(true);
   });
 });

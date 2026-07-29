@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -116,8 +117,12 @@ async function runVisualizer({ targetRoot, host, port }) {
   console.log(`\nRoute Atlas scanning: ${targetRoot}`);
   console.log(`Open http://${host}:${port}\n`);
   forwardSignals(child);
-  const exitCode = await waitForExit(child);
-  process.exitCode = exitCode;
+  try {
+    const exitCode = await waitForExit(child);
+    process.exitCode = exitCode;
+  } finally {
+    cleanupRuntime(child);
+  }
 }
 
 async function runJsonScan({ targetRoot, host, port, out }) {
@@ -144,16 +149,19 @@ async function runJsonScan({ targetRoot, host, port, out }) {
     throw new Error(`${message}\n${logs.slice(-2000)}`);
   } finally {
     child.kill("SIGTERM");
+    await waitForExit(child, 2000);
+    cleanupRuntime(child);
   }
 }
 
 function startNext({ targetRoot, host, port, stdio, scanMode }) {
   const nextBin = require.resolve("next/dist/bin/next");
+  const runtimeRoot = createRuntimeAppRoot();
   const child = spawn(
     process.execPath,
-    [nextBin, "dev", packageRoot, "--hostname", host, "--port", String(port)],
+    [nextBin, "dev", runtimeRoot, "--webpack", "--hostname", host, "--port", String(port)],
     {
-      cwd: packageRoot,
+      cwd: runtimeRoot,
       env: {
         ...process.env,
         PAGE_VISUALS_TARGET_ROOT: targetRoot,
@@ -164,7 +172,28 @@ function startNext({ targetRoot, host, port, stdio, scanMode }) {
       stdio,
     },
   );
+  child.routeAtlasRuntimeRoot = runtimeRoot;
   return child;
+}
+
+export function createRuntimeAppRoot(root = packageRoot) {
+  const runtimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "route-atlas-app-"));
+  for (const entry of ["package.json", "next.config.ts", "postcss.config.mjs", "tsconfig.json", "src", "public"]) {
+    const source = path.join(root, entry);
+    if (fs.existsSync(source)) {
+      fs.cpSync(source, path.join(runtimeRoot, entry), { recursive: true });
+    }
+  }
+  fs.symlinkSync(resolveDependencyRoot(), path.join(runtimeRoot, "node_modules"), process.platform === "win32" ? "junction" : "dir");
+  return runtimeRoot;
+}
+
+function resolveDependencyRoot() {
+  const localNodeModules = path.join(packageRoot, "node_modules");
+  if (fs.existsSync(localNodeModules)) {
+    return localNodeModules;
+  }
+  return path.dirname(path.dirname(require.resolve("next/package.json")));
 }
 
 async function waitForScanJson(host, port) {
@@ -261,10 +290,38 @@ function forwardSignals(child) {
   }
 }
 
-function waitForExit(child) {
+function waitForExit(child, timeoutMs) {
   return new Promise((resolve) => {
-    child.once("exit", (code) => resolve(code ?? 0));
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve(child.exitCode ?? 0);
+      return;
+    }
+    const timeout = timeoutMs
+      ? setTimeout(() => {
+          child.off("exit", onExit);
+          resolve(child.exitCode ?? 0);
+        }, timeoutMs)
+      : undefined;
+    function onExit(code) {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      resolve(code ?? 0);
+    }
+    child.once("exit", onExit);
   });
+}
+
+function cleanupRuntime(child) {
+  if (!child.routeAtlasRuntimeRoot) {
+    return;
+  }
+  try {
+    fs.rmSync(child.routeAtlasRuntimeRoot, { force: true, recursive: true });
+  } catch {
+    // Temporary runtime cleanup should not mask the CLI's real result.
+  }
+  child.routeAtlasRuntimeRoot = undefined;
 }
 
 function delay(ms) {
@@ -273,7 +330,18 @@ function delay(ms) {
   });
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+export function isDirectCliInvocation(argvPath = process.argv[1]) {
+  if (!argvPath) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(argvPath) === fileURLToPath(import.meta.url);
+  } catch {
+    return pathToFileURL(argvPath).href === import.meta.url;
+  }
+}
+
+if (isDirectCliInvocation()) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : error);
     process.exitCode = 1;
