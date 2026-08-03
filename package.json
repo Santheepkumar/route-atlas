@@ -1,6 +1,6 @@
 {
   "name": "route-atlas",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": false,
   "description": "Local Next.js App Router atlas for routes, layouts, components, navigation, and data flow.",
   "repository": {
@@ -24,7 +24,7 @@
     "route-atlas": "bin/route-atlas.mjs"
   },
   "files": [
-    ".next/standalone",
+    "dist/standalone",
     "bin/route-atlas.mjs",
     "scripts/prepare-standalone.mjs",
     "src/app",

@@ -151,7 +151,7 @@ async function runJsonScan({ targetRoot, host, port, out }) {
 }
 
 function startProductionServer({ targetRoot, host, port, stdio, scanMode }) {
-  const standaloneRoot = path.join(packageRoot, ".next", "standalone");
+  const standaloneRoot = resolveStandaloneRoot();
   const serverEntry = path.join(standaloneRoot, "server.js");
   if (!fs.existsSync(serverEntry)) {
     throw new Error("Route Atlas production bundle is missing. Run `pnpm build` before using the local CLI, or reinstall the npm package.");
@@ -175,6 +175,15 @@ function startProductionServer({ targetRoot, host, port, stdio, scanMode }) {
     },
   );
   return child;
+}
+
+function resolveStandaloneRoot() {
+  const publishRoot = path.join(packageRoot, "dist", "standalone");
+  const localRoot = path.join(packageRoot, ".next", "standalone");
+  if (fs.existsSync(path.join(publishRoot, "server.js"))) {
+    return publishRoot;
+  }
+  return localRoot;
 }
 
 export function ensureStandaloneAliases(standaloneRoot) {
