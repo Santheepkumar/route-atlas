@@ -51,6 +51,22 @@ describe("deriveSceneGraph", () => {
     expect(scene.nodes.some((node) => node.id === "component:1")).toBe(true);
     expect(scene.edges.some((edge) => edge.kind === "component-use" && edge.source === selectedId)).toBe(true);
   });
+
+  it("budgets large component maps before full deep mode", async () => {
+    const graph = createSyntheticGraph(700, 2400);
+    const scene = await deriveSceneGraph({
+      graph,
+      mode: "components",
+      query: "",
+      selectedId: null,
+      largeGraphMode: "guarded",
+    });
+
+    expect(scene.nodes.length).toBeLessThan(graph.nodes.length);
+    expect(scene.hiddenNodeCount).toBeGreaterThan(0);
+    expect(scene.hiddenEdgeCount).toBeGreaterThan(0);
+    expect(scene.nodes.some((node) => node.kind === "route")).toBe(true);
+  });
 });
 
 function createSyntheticGraph(routeCount: number, extraEdges: number): ScanGraph {

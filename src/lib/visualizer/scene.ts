@@ -134,6 +134,8 @@ const CANVAS_NODE_THRESHOLD = 160;
 const CANVAS_EDGE_THRESHOLD = 360;
 const FAST_LAYOUT_NODE_THRESHOLD = 850;
 const FAST_LAYOUT_EDGE_THRESHOLD = 2200;
+const LARGE_MODE_NODE_BUDGET = 420;
+const LARGE_MODE_EDGE_BUDGET = 1200;
 
 export async function deriveSceneGraph(job: Omit<WorkerJob, "id">): Promise<SceneGraph> {
   const totalStart = now();
@@ -237,9 +239,21 @@ function deriveVisibleGraph(
     return true;
   };
 
-  const nodes = graph.nodes.filter((node) => inMode(node) && matchesQuery(node, normalizedQuery));
+  const allModeNodes = graph.nodes.filter((node) => inMode(node) && matchesQuery(node, normalizedQuery));
+  const allModeNodeIds = new Set(allModeNodes.map((node) => node.id));
+  const allModeEdges = candidateEdges.filter((edge) => allModeNodeIds.has(edge.source) && allModeNodeIds.has(edge.target));
+  const budgetedGraph = budgetLargeModeGraph({
+    mode,
+    query: normalizedQuery,
+    nodes: allModeNodes,
+    edges: allModeEdges,
+    selectedNeighborhood,
+    connectedNodeIds,
+    largeGraphMode,
+  });
+  const nodes = budgetedGraph.nodes;
   const nodeIds = new Set(nodes.map((node) => node.id));
-  const edges = candidateEdges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
+  const edges = budgetedGraph.edges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
   const quietNodeIds = new Set<string>();
   if (mode === "story" || (mode === "all" && largeGraphMode === "guarded")) {
     for (const node of nodes) {
@@ -257,9 +271,98 @@ function deriveVisibleGraph(
     const fullEdges = graph.edges.filter((edge) => fullNodeIds.has(edge.source) && fullNodeIds.has(edge.target));
     hiddenNodeCount = Math.max(0, fullNodes.length - nodes.length);
     hiddenEdgeCount = Math.max(0, fullEdges.length - edges.length);
+  } else {
+    hiddenNodeCount = budgetedGraph.hiddenNodeCount;
+    hiddenEdgeCount = budgetedGraph.hiddenEdgeCount;
   }
 
   return { nodes, edges, quietNodeIds, hiddenNodeCount, hiddenEdgeCount };
+}
+
+function budgetLargeModeGraph({
+  mode,
+  query,
+  nodes,
+  edges,
+  selectedNeighborhood,
+  connectedNodeIds,
+  largeGraphMode,
+}: {
+  mode: Mode;
+  query: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  selectedNeighborhood: Set<string>;
+  connectedNodeIds: Set<string>;
+  largeGraphMode: LargeGraphMode;
+}) {
+  const shouldBudget =
+    !query &&
+    largeGraphMode === "guarded" &&
+    ["components", "data", "navigation"].includes(mode) &&
+    (nodes.length > LARGE_MODE_NODE_BUDGET || edges.length > LARGE_MODE_EDGE_BUDGET);
+
+  if (!shouldBudget) {
+    return { nodes, edges, hiddenNodeCount: 0, hiddenEdgeCount: 0 };
+  }
+
+  const degree = new Map<string, number>();
+  for (const edge of edges) {
+    degree.set(edge.source, (degree.get(edge.source) ?? 0) + 1);
+    degree.set(edge.target, (degree.get(edge.target) ?? 0) + 1);
+  }
+
+  const protectedIds = new Set<string>();
+  for (const node of nodes) {
+    if (routeNodeKinds.has(node.kind) || selectedNeighborhood.has(node.id)) {
+      protectedIds.add(node.id);
+    }
+  }
+
+  const budget = Math.max(LARGE_MODE_NODE_BUDGET, protectedIds.size + 80);
+  const protectedNodes = nodes.filter((node) => protectedIds.has(node.id));
+  const remainingNodes = nodes
+    .filter((node) => !protectedIds.has(node.id) && connectedNodeIds.has(node.id))
+    .sort((a, b) => scoreNodeForMode(b, mode, degree) - scoreNodeForMode(a, mode, degree));
+  const nextNodes = [...protectedNodes, ...remainingNodes.slice(0, Math.max(0, budget - protectedNodes.length))];
+  const nextNodeIds = new Set(nextNodes.map((node) => node.id));
+  const nextEdges = edges
+    .filter((edge) => nextNodeIds.has(edge.source) && nextNodeIds.has(edge.target))
+    .sort((a, b) => scoreEdgeForMode(b, mode) - scoreEdgeForMode(a, mode))
+    .slice(0, LARGE_MODE_EDGE_BUDGET);
+
+  return {
+    nodes: nextNodes,
+    edges: nextEdges,
+    hiddenNodeCount: Math.max(0, nodes.length - nextNodes.length),
+    hiddenEdgeCount: Math.max(0, edges.length - nextEdges.length),
+  };
+}
+
+function scoreNodeForMode(node: GraphNode, mode: Mode, degree: Map<string, number>) {
+  const base = degree.get(node.id) ?? 0;
+  const kindBoost =
+    mode === "components" && ["component", "page", "layout"].includes(node.kind)
+      ? 80
+      : mode === "data" && ["data", "metadata", "param", "page", "layout"].includes(node.kind)
+        ? 80
+        : mode === "navigation" && routeNodeKinds.has(node.kind)
+          ? 80
+          : 0;
+  return base + kindBoost;
+}
+
+function scoreEdgeForMode(edge: GraphEdge, mode: Mode) {
+  if (mode === "components" && edge.kind === "component-use") {
+    return 3;
+  }
+  if (mode === "data" && ["fetch-call", "server-action"].includes(edge.kind)) {
+    return 3;
+  }
+  if (mode === "navigation" && ["next-link", "router-navigation"].includes(edge.kind)) {
+    return 3;
+  }
+  return 1;
 }
 
 async function elkLayout(
@@ -321,9 +424,9 @@ function fastLayout(nodes: GraphNode[], quietNodeIds: Set<string>) {
     for (let index = 0; index < laneNodes.length; index += 1) {
       const node = laneNodes[index];
       const size = nodeSize(node);
-      const columnOffset = Math.floor(index / 56) * 320;
-      const row = index % 56;
-      sceneNodes.push(toSceneNode(node, laneIndex * 340 + columnOffset, row * 104, size.width, size.height, quietNodeIds.has(node.id)));
+      const columnOffset = Math.floor(index / 36) * 360;
+      const row = index % 36;
+      sceneNodes.push(toSceneNode(node, laneIndex * 380 + columnOffset, row * 112, size.width, size.height, quietNodeIds.has(node.id)));
     }
   }
   return sceneNodes;
@@ -358,9 +461,12 @@ function toSceneEdge(edge: GraphEdge, nodeById: Map<string, SceneNode>) {
 
 function nodeSize(node: GraphNode) {
   if (node.kind === "route") {
-    return { width: 240, height: 98 };
+    return { width: 280, height: 104 };
   }
-  return { width: 188, height: 72 };
+  if (routeNodeKinds.has(node.kind)) {
+    return { width: 220, height: 78 };
+  }
+  return { width: 208, height: 74 };
 }
 
 function laneForNode(node: GraphNode) {
@@ -394,10 +500,10 @@ function lodForZoom(zoom: number, graphIsLarge: boolean): SceneLOD {
   if (!graphIsLarge) {
     return "detail";
   }
-  if (zoom < 0.22) {
+  if (zoom < 0.1) {
     return "cluster";
   }
-  if (zoom < 0.58) {
+  if (zoom < 0.48) {
     return "overview";
   }
   return "detail";

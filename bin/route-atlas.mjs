@@ -371,6 +371,12 @@ function forwardSignals(child) {
   }
 }
 
+function cleanupRuntime(child) {
+  if (child.exitCode === null && child.signalCode === null && !child.killed) {
+    child.kill("SIGTERM");
+  }
+}
+
 function waitForExit(child, timeoutMs) {
   return new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) {

@@ -118,6 +118,7 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
       });
     }
     context.restore();
+    drawReadableLabels(context, visibleNodes, viewport, selectedId, hoveredId, lod);
 
     renderCountRef.current += 1;
     onTelemetry?.({
@@ -236,6 +237,19 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
           });
         }}
       />
+      <CanvasControls
+        onZoomIn={() => zoomCanvas(canvasRef, viewportRef, updateViewport, 1.25)}
+        onZoomOut={() => zoomCanvas(canvasRef, viewportRef, updateViewport, 0.8)}
+        onFit={() => {
+          const canvas = canvasRef.current;
+          if (!canvas) {
+            return;
+          }
+          fitScene(canvas, scene, viewportRef);
+          updateViewport(viewportRef.current);
+        }}
+      />
+      <CanvasHint scene={scene} />
       {selectedId ? <SelectedNodeBadge node={nodeById.get(selectedId)} /> : null}
       <div className="sr-only" aria-live="polite">
         {selectedId ? `Selected ${nodeById.get(selectedId)?.label ?? selectedId}` : `${scene.nodes.length} nodes in the route map`}
@@ -251,9 +265,10 @@ function fitScene(canvas: HTMLCanvasElement, scene: SceneGraph, viewportRef: Rea
     return;
   }
   const padding = 96;
+  const minReadableZoom = scene.graphIsLarge ? 0.16 : 0.06;
   const zoom = clamp(
     Math.min((rect.width - padding) / Math.max(scene.bounds.width, 1), (rect.height - padding) / Math.max(scene.bounds.height, 1)),
-    0.06,
+    minReadableZoom,
     1.1,
   );
   viewportRef.current = {
@@ -314,7 +329,7 @@ function drawNode(
   const palette = nodePalette[node.kind];
   context.save();
   context.globalAlpha = node.quiet && !state.selected ? 0.48 : 1;
-  context.fillStyle = state.lod === "cluster" ? palette.border : palette.fill;
+  context.fillStyle = state.lod === "cluster" ? tintForKind(node.kind) : palette.fill;
   context.strokeStyle = state.selected || state.hovered ? palette.border : "#dbe3ed";
   context.lineWidth = state.selected ? 3 : 1.5;
   roundRect(context, node.x, node.y, node.width, node.height, 7);
@@ -341,12 +356,179 @@ function drawNode(
   context.restore();
 }
 
+function drawReadableLabels(
+  context: CanvasRenderingContext2D,
+  nodes: SceneNode[],
+  viewport: SceneViewport,
+  selectedId: string | null,
+  hoveredId: string | null,
+  lod: "cluster" | "overview" | "detail",
+) {
+  if (lod === "detail") {
+    return;
+  }
+
+  const labelRects: Array<{ x: number; y: number; width: number; height: number }> = [];
+  const candidates = nodes
+    .filter((node) => shouldDrawScreenLabel(node, selectedId, hoveredId))
+    .sort((a, b) => labelPriority(b, selectedId, hoveredId) - labelPriority(a, selectedId, hoveredId))
+    .slice(0, lod === "cluster" ? 70 : 120);
+
+  context.save();
+  context.font = "600 12px Arial, sans-serif";
+  context.textBaseline = "middle";
+
+  for (const node of candidates) {
+    const label = labelForNode(node);
+    const screenX = (node.x - viewport.x) * viewport.zoom;
+    const screenY = (node.y - viewport.y) * viewport.zoom;
+    const screenWidth = node.width * viewport.zoom;
+    const palette = nodePalette[node.kind];
+    const text = truncate(context, label, 210);
+    const textWidth = context.measureText(text).width;
+    const x = screenWidth > 96 ? screenX + 10 : screenX + screenWidth + 6;
+    const y = Math.max(18, screenY - 9);
+    const rect = { x: x - 7, y: y - 10, width: textWidth + 14, height: 20 };
+
+    if (labelRects.some((existing) => rectsIntersect(existing, rect))) {
+      continue;
+    }
+
+    context.globalAlpha = node.id === selectedId || node.id === hoveredId ? 1 : 0.88;
+    context.fillStyle = "rgba(255, 255, 255, 0.94)";
+    context.strokeStyle = node.id === selectedId || node.id === hoveredId ? palette.border : "rgba(148, 163, 184, 0.5)";
+    context.lineWidth = 1;
+    roundRect(context, rect.x, rect.y, rect.width, rect.height, 5);
+    context.fill();
+    context.stroke();
+
+    context.fillStyle = palette.text;
+    context.fillText(text, x, y + 0.5);
+    labelRects.push(rect);
+  }
+
+  context.restore();
+}
+
+function shouldDrawScreenLabel(node: SceneNode, selectedId: string | null, hoveredId: string | null) {
+  if (node.id === selectedId || node.id === hoveredId) {
+    return true;
+  }
+  return ["route", "page", "layout", "route-handler", "data", "metadata", "param"].includes(node.kind);
+}
+
+function labelPriority(node: SceneNode, selectedId: string | null, hoveredId: string | null) {
+  if (node.id === selectedId) {
+    return 1000;
+  }
+  if (node.id === hoveredId) {
+    return 900;
+  }
+  if (node.kind === "route") {
+    return 700 + (node.dynamic ? 30 : 0);
+  }
+  if (node.kind === "page" || node.kind === "layout") {
+    return 550;
+  }
+  if (node.kind === "route-handler") {
+    return 520;
+  }
+  return 350;
+}
+
+function labelForNode(node: SceneNode) {
+  if (node.kind === "route") {
+    return node.route ?? node.label;
+  }
+  if (node.route && node.specialFile) {
+    return `${node.specialFile} ${node.route}`;
+  }
+  return node.route ?? node.label;
+}
+
+function tintForKind(kind: GraphNodeKind) {
+  if (kind === "route") {
+    return "#334155";
+  }
+  if (kind === "page") {
+    return "#2563eb";
+  }
+  if (kind === "layout" || kind === "template") {
+    return "#d97706";
+  }
+  if (kind === "route-handler") {
+    return "#0891b2";
+  }
+  if (kind === "component") {
+    return "#16a34a";
+  }
+  if (kind === "data" || kind === "metadata" || kind === "param") {
+    return "#fb7185";
+  }
+  return "#64748b";
+}
+
+function CanvasControls({ onZoomIn, onZoomOut, onFit }: { onZoomIn: () => void; onZoomOut: () => void; onFit: () => void }) {
+  return (
+    <div className="absolute bottom-4 left-4 flex overflow-hidden rounded-md border border-slate-200 bg-white shadow-sm">
+      <button type="button" onClick={onZoomIn} className="grid size-9 place-items-center border-r border-slate-200 text-lg font-medium text-slate-700 hover:bg-slate-50" title="Zoom in">
+        +
+      </button>
+      <button type="button" onClick={onZoomOut} className="grid size-9 place-items-center border-r border-slate-200 text-lg font-medium text-slate-700 hover:bg-slate-50" title="Zoom out">
+        -
+      </button>
+      <button type="button" onClick={onFit} className="grid h-9 px-3 text-xs font-semibold text-slate-700 hover:bg-slate-50" title="Fit map">
+        Fit
+      </button>
+    </div>
+  );
+}
+
+function CanvasHint({ scene }: { scene: SceneGraph }) {
+  if (!scene.graphIsLarge) {
+    return null;
+  }
+
+  return (
+    <div className="pointer-events-none absolute right-4 top-4 max-w-xs rounded-md border border-slate-200 bg-white/92 px-3 py-2 text-xs text-slate-600 shadow-sm backdrop-blur">
+      <div className="font-semibold text-slate-900">Large map view</div>
+      <div className="mt-0.5">
+        Drag to pan, scroll to zoom. Labels stay readable while deep nodes stay lightweight.
+      </div>
+    </div>
+  );
+}
+
+function zoomCanvas(
+  canvasRef: React.RefObject<HTMLCanvasElement | null>,
+  viewportRef: React.MutableRefObject<SceneViewport>,
+  updateViewport: (viewport: SceneViewport) => void,
+  factor: number,
+) {
+  const rect = canvasRef.current?.getBoundingClientRect();
+  if (!rect) {
+    return;
+  }
+  const viewport = viewportRef.current;
+  const nextZoom = clamp(viewport.zoom * factor, 0.08, 2);
+  const centerX = rect.width / 2;
+  const centerY = rect.height / 2;
+  const worldX = viewport.x + centerX / viewport.zoom;
+  const worldY = viewport.y + centerY / viewport.zoom;
+  updateViewport({
+    ...viewport,
+    zoom: nextZoom,
+    x: worldX - centerX / nextZoom,
+    y: worldY - centerY / nextZoom,
+  });
+}
+
 function SelectedNodeBadge({ node }: { node?: SceneNode }) {
   if (!node) {
     return null;
   }
   return (
-    <div className="pointer-events-none absolute bottom-4 left-4 max-w-xs rounded-md border border-slate-200 bg-white/95 px-3 py-2 text-xs text-slate-600 shadow-sm backdrop-blur">
+    <div className="pointer-events-none absolute bottom-16 left-4 max-w-xs rounded-md border border-slate-200 bg-white/95 px-3 py-2 text-xs text-slate-600 shadow-sm backdrop-blur">
       <div className="font-semibold text-slate-900">{node.route ?? node.label}</div>
       <div className="mt-0.5 truncate">{node.file ?? node.kind}</div>
     </div>
@@ -379,10 +561,10 @@ function lodForZoom(zoom: number, graphIsLarge: boolean) {
   if (!graphIsLarge) {
     return "detail";
   }
-  if (zoom < 0.22) {
+  if (zoom < 0.1) {
     return "cluster";
   }
-  if (zoom < 0.58) {
+  if (zoom < 0.48) {
     return "overview";
   }
   return "detail";
