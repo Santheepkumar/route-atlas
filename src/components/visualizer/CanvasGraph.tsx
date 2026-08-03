@@ -118,7 +118,6 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
       });
     }
     context.restore();
-    drawReadableLabels(context, visibleNodes, viewport, selectedId, hoveredId, lod);
 
     renderCountRef.current += 1;
     onTelemetry?.({
@@ -354,96 +353,6 @@ function drawNode(
     }
   }
   context.restore();
-}
-
-function drawReadableLabels(
-  context: CanvasRenderingContext2D,
-  nodes: SceneNode[],
-  viewport: SceneViewport,
-  selectedId: string | null,
-  hoveredId: string | null,
-  lod: "cluster" | "overview" | "detail",
-) {
-  if (lod === "detail") {
-    return;
-  }
-
-  const labelRects: Array<{ x: number; y: number; width: number; height: number }> = [];
-  const candidates = nodes
-    .filter((node) => shouldDrawScreenLabel(node, selectedId, hoveredId))
-    .sort((a, b) => labelPriority(b, selectedId, hoveredId) - labelPriority(a, selectedId, hoveredId))
-    .slice(0, lod === "cluster" ? 70 : 120);
-
-  context.save();
-  context.font = "600 12px Arial, sans-serif";
-  context.textBaseline = "middle";
-
-  for (const node of candidates) {
-    const label = labelForNode(node);
-    const screenX = (node.x - viewport.x) * viewport.zoom;
-    const screenY = (node.y - viewport.y) * viewport.zoom;
-    const screenWidth = node.width * viewport.zoom;
-    const palette = nodePalette[node.kind];
-    const text = truncate(context, label, 210);
-    const textWidth = context.measureText(text).width;
-    const x = screenWidth > 96 ? screenX + 10 : screenX + screenWidth + 6;
-    const y = Math.max(18, screenY - 9);
-    const rect = { x: x - 7, y: y - 10, width: textWidth + 14, height: 20 };
-
-    if (labelRects.some((existing) => rectsIntersect(existing, rect))) {
-      continue;
-    }
-
-    context.globalAlpha = node.id === selectedId || node.id === hoveredId ? 1 : 0.88;
-    context.fillStyle = "rgba(255, 255, 255, 0.94)";
-    context.strokeStyle = node.id === selectedId || node.id === hoveredId ? palette.border : "rgba(148, 163, 184, 0.5)";
-    context.lineWidth = 1;
-    roundRect(context, rect.x, rect.y, rect.width, rect.height, 5);
-    context.fill();
-    context.stroke();
-
-    context.fillStyle = palette.text;
-    context.fillText(text, x, y + 0.5);
-    labelRects.push(rect);
-  }
-
-  context.restore();
-}
-
-function shouldDrawScreenLabel(node: SceneNode, selectedId: string | null, hoveredId: string | null) {
-  if (node.id === selectedId || node.id === hoveredId) {
-    return true;
-  }
-  return ["route", "page", "layout", "route-handler", "data", "metadata", "param"].includes(node.kind);
-}
-
-function labelPriority(node: SceneNode, selectedId: string | null, hoveredId: string | null) {
-  if (node.id === selectedId) {
-    return 1000;
-  }
-  if (node.id === hoveredId) {
-    return 900;
-  }
-  if (node.kind === "route") {
-    return 700 + (node.dynamic ? 30 : 0);
-  }
-  if (node.kind === "page" || node.kind === "layout") {
-    return 550;
-  }
-  if (node.kind === "route-handler") {
-    return 520;
-  }
-  return 350;
-}
-
-function labelForNode(node: SceneNode) {
-  if (node.kind === "route") {
-    return node.route ?? node.label;
-  }
-  if (node.route && node.specialFile) {
-    return `${node.specialFile} ${node.route}`;
-  }
-  return node.route ?? node.label;
 }
 
 function tintForKind(kind: GraphNodeKind) {
