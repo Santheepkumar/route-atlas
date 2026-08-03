@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import {
   Background,
   BaseEdge,
@@ -17,8 +17,6 @@ import {
   type Node as FlowNode,
   type NodeProps,
 } from "@xyflow/react";
-import ELK from "elkjs/lib/elk.bundled.js";
-import type { ElkNode } from "elkjs/lib/elk-api";
 import {
   AlertTriangle,
   Boxes,
@@ -34,10 +32,19 @@ import {
   Search,
   Sparkles,
 } from "lucide-react";
+import { CanvasGraph } from "./CanvasGraph";
+import {
+  deriveSceneGraph,
+  getGraphNodeBadges,
+  type LargeGraphMode,
+  type Mode,
+  type SceneWorkerRequest,
+  type SceneGraph,
+  type WorkerJob,
+  type WorkerResult,
+} from "@/lib/visualizer/scene";
 import type { GraphEdge, GraphEdgeKind, GraphNode, GraphNodeKind, ScanError, ScanGraph } from "@/lib/visualizer/types";
 
-type Mode = "story" | "routes" | "components" | "data" | "navigation" | "all";
-type LargeGraphMode = "guarded" | "full";
 type LayoutStatus = "idle" | "pending" | "ready" | "failed";
 type VisualNode = FlowNode<VisualNodeData, "visual">;
 type VisualEdge = FlowEdge<VisualEdgeData, "visual">;
@@ -62,17 +69,6 @@ type GraphIndex = {
   relationshipsByNode: Map<string, GraphEdge[]>;
 };
 
-const elk = new ELK({
-  defaultLayoutOptions: {
-    "elk.algorithm": "layered",
-    "elk.direction": "RIGHT",
-    "elk.spacing.nodeNode": "36",
-    "elk.layered.spacing.nodeNodeBetweenLayers": "86",
-    "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
-    "elk.edgeRouting": "SPLINES",
-  },
-});
-
 const modeOptions: Array<{ id: Mode; label: string; icon: typeof Route }> = [
   { id: "story", label: "Route Story", icon: Sparkles },
   { id: "routes", label: "Routes", icon: Route },
@@ -82,58 +78,8 @@ const modeOptions: Array<{ id: Mode; label: string; icon: typeof Route }> = [
   { id: "all", label: "All", icon: GitBranch },
 ];
 
-const routeNodeKinds = new Set<GraphNodeKind>([
-  "route",
-  "page",
-  "layout",
-  "template",
-  "loading",
-  "error",
-  "not-found",
-  "default",
-  "route-handler",
-]);
-
-const storyEdgeKinds = new Set<GraphEdgeKind>([
-  "route-nesting",
-  "route-owns-file",
-  "layout-wraps",
-  "parallel-slot",
-  "intercepts",
-  "route-handler",
-  "next-link",
-  "anchor-link",
-  "router-navigation",
-]);
-
-const expansionEdgeKinds = new Set<GraphEdgeKind>([
-  "imports",
-  "component-use",
-  "fetch-call",
-  "server-action",
-  "metadata",
-  "dynamic-param",
-]);
-
-const allGuardedEdgeKinds = new Set<GraphEdgeKind>([
-  ...storyEdgeKinds,
-  "fetch-call",
-  "server-action",
-  "metadata",
-  "dynamic-param",
-]);
-
-const LARGE_GRAPH_NODE_THRESHOLD = 180;
-const LARGE_GRAPH_EDGE_THRESHOLD = 420;
 const HIDE_LABEL_EDGE_THRESHOLD = 180;
 const HIDE_MINIMAP_NODE_THRESHOLD = 260;
-
-const edgeKindsByMode: Record<Exclude<Mode, "story" | "all">, Set<GraphEdgeKind>> = {
-  routes: new Set(["route-nesting", "route-owns-file", "layout-wraps", "parallel-slot", "intercepts", "route-handler"]),
-  components: new Set(["imports", "component-use"]),
-  data: new Set(["fetch-call", "server-action", "metadata", "dynamic-param"]),
-  navigation: new Set(["next-link", "anchor-link", "router-navigation"]),
-};
 
 const nodePalette: Record<GraphNodeKind, { fill: string; border: string; text: string; chip: string }> = {
   route: { fill: "#f8fafc", border: "#0f172a", text: "#0f172a", chip: "#e2e8f0" },
@@ -172,26 +118,47 @@ const edgePalette: Record<GraphEdgeKind, string> = {
   "dynamic-param": "#0e7490",
 };
 
-const nodeTypes = { visual: IdeNode };
-const edgeTypes = { visual: IdeEdge };
+const nodeTypes = { visual: memo(IdeNode) };
+const edgeTypes = { visual: memo(IdeEdge) };
 
 export default function VisualizerApp() {
   const [graph, setGraph] = useState<ScanGraph | null>(null);
+  const [scene, setScene] = useState<SceneGraph | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [sceneError, setSceneError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [mode, setMode] = useState<Mode>("story");
   const [largeGraphMode, setLargeGraphMode] = useState<LargeGraphMode>("guarded");
   const [layoutStatus, setLayoutStatus] = useState<LayoutStatus>("idle");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [laidOutNodes, setLaidOutNodes] = useState<VisualNode[]>([]);
   const [isPending, startTransition] = useTransition();
+  const [telemetry, setTelemetry] = useState({ renderCount: 0, visibleNodes: 0, visibleEdges: 0, drawMs: 0 });
   const deferredQuery = useDeferredValue(query);
-  const layoutCache = useRef(new Map<string, VisualNode[]>());
+  const workerRef = useRef<Worker | null>(null);
+  const latestJobId = useRef(0);
+
+  useEffect(() => {
+    try {
+      workerRef.current = new Worker(new URL("./scene-worker.ts", import.meta.url), { type: "module" });
+      workerRef.current.onmessage = (event: MessageEvent<WorkerResult>) => {
+        if (event.data.id !== latestJobId.current) {
+          return;
+        }
+        setScene(event.data.scene);
+        setSceneError(event.data.error ?? null);
+        setLayoutStatus(event.data.status === "ready" ? "ready" : "failed");
+      };
+    } catch {
+      workerRef.current = null;
+    }
+    return () => workerRef.current?.terminate();
+  }, []);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setSceneError(null);
     try {
       const response = await fetch("/api/scan", { cache: "no-store" });
       const payload = (await response.json()) as ScanGraph | ScanError;
@@ -199,7 +166,7 @@ export default function VisualizerApp() {
         throw new Error("error" in payload ? payload.details ?? payload.error : "Scan failed.");
       }
       setGraph(payload);
-      layoutCache.current.clear();
+      setScene(null);
       setSelectedId(null);
       setMode("story");
       setLargeGraphMode("guarded");
@@ -217,114 +184,93 @@ export default function VisualizerApp() {
     return () => window.clearTimeout(timer);
   }, [refresh]);
 
-  const graphIndex = useMemo(() => buildGraphIndex(graph), [graph]);
-  const selectedNode = selectedId ? graphIndex.nodeById.get(selectedId) ?? null : null;
-  const selectedEdges = selectedId ? graphIndex.relationshipsByNode.get(selectedId) ?? [] : [];
-
-  const visibleGraph = useMemo(
-    () => deriveVisibleGraph(graph, mode, deferredQuery, selectedId, largeGraphMode),
-    [graph, mode, deferredQuery, selectedId, largeGraphMode],
-  );
-  const graphIsLarge = visibleGraph.nodes.length > LARGE_GRAPH_NODE_THRESHOLD || visibleGraph.edges.length > LARGE_GRAPH_EDGE_THRESHOLD;
-  const showEdgeLabels = visibleGraph.edges.length <= HIDE_LABEL_EDGE_THRESHOLD;
-  const showMiniMap = visibleGraph.nodes.length <= HIDE_MINIMAP_NODE_THRESHOLD;
-  const graphWorkPending = loading || isPending || layoutStatus === "pending" || query !== deferredQuery;
-
-  const flowEdges = useMemo<VisualEdge[]>(
-    () =>
-      visibleGraph.edges.map((edge) => ({
-        id: edge.id,
-        type: "visual",
-        source: edge.source,
-        target: edge.target,
-        label: showEdgeLabels ? edge.label : undefined,
-        animated: edge.confidence === "inferred" && !graphIsLarge,
-        data: { graphEdge: edge, showLabel: showEdgeLabels },
-      })),
-    [graphIsLarge, showEdgeLabels, visibleGraph.edges],
-  );
-
-  const flowNodes = useMemo<VisualNode[]>(
-    () =>
-      visibleGraph.nodes.map((node) => ({
-        id: node.id,
-        type: "visual",
-        position: { x: 0, y: 0 },
-        data: {
-          label: node.label,
-          kind: node.kind,
-          badges: getBadges(node),
-          route: node.route,
-          file: node.file,
-          graphNode: node,
-          quiet: visibleGraph.quietNodeIds.has(node.id),
-        },
-      })),
-    [visibleGraph.nodes, visibleGraph.quietNodeIds],
-  );
+  useEffect(() => {
+    workerRef.current?.postMessage({ type: "set-graph", graph } satisfies SceneWorkerRequest);
+  }, [graph]);
 
   useEffect(() => {
-    let cancelled = false;
-    async function layoutVisibleGraph() {
-      if (!flowNodes.length) {
-        setLaidOutNodes([]);
-        setLayoutStatus(graph ? "ready" : "idle");
-        return;
+    const worker = workerRef.current;
+    const job: WorkerJob = {
+      id: latestJobId.current + 1,
+      graph: worker ? null : graph,
+      mode,
+      query: deferredQuery,
+      selectedId,
+      largeGraphMode,
+    };
+    latestJobId.current = job.id;
+    queueMicrotask(() => {
+      if (latestJobId.current === job.id) {
+        setLayoutStatus(graph ? "pending" : "idle");
+        setSceneError(null);
       }
-      const cacheKey = [
-        graph?.generatedAt,
-        mode,
-        largeGraphMode,
-        deferredQuery,
-        selectedId ?? "",
-        flowNodes.map((node) => node.id).join("|"),
-        flowEdges.map((edge) => edge.id).join("|"),
-      ].join("::");
-      const cached = layoutCache.current.get(cacheKey);
-      if (cached) {
-        setLaidOutNodes(cached);
-        setLayoutStatus("ready");
-        return;
-      }
-      setLayoutStatus("pending");
-      const graphToLayout: ElkNode = {
-        id: "root",
-        children: flowNodes.map((node) => ({
-          id: node.id,
-          width: node.data.kind === "route" ? 240 : 188,
-          height: node.data.kind === "route" ? 98 : 72,
-        })),
-        edges: flowEdges.map((edge) => ({ id: edge.id, sources: [edge.source], targets: [edge.target] })),
-      };
+    });
 
-      try {
-        const layout = await elk.layout(graphToLayout);
-        const positions = new Map((layout.children ?? []).map((node) => [node.id, node]));
-        if (!cancelled) {
-          const nextNodes = flowNodes.map((node) => {
-              const position = positions.get(node.id);
-              return {
-                ...node,
-                position: { x: position?.x ?? 0, y: position?.y ?? 0 },
-              };
-            });
-          layoutCache.current.set(cacheKey, nextNodes);
-          setLaidOutNodes(nextNodes);
-          setLayoutStatus("ready");
-        }
-      } catch {
-        if (!cancelled) {
-          setLaidOutNodes(flowNodes);
-          setLayoutStatus("failed");
-        }
-      }
+    if (worker) {
+      worker.postMessage({ type: "derive", job } satisfies SceneWorkerRequest);
+      return;
     }
 
-    void layoutVisibleGraph();
+    let cancelled = false;
+    void deriveSceneGraph(job)
+      .then((nextScene) => {
+        if (!cancelled && latestJobId.current === job.id) {
+          setScene(nextScene);
+          setLayoutStatus("ready");
+        }
+      })
+      .catch((layoutError) => {
+        if (!cancelled && latestJobId.current === job.id) {
+          setSceneError(layoutError instanceof Error ? layoutError.message : "Scene layout failed.");
+          setLayoutStatus("failed");
+        }
+      });
     return () => {
       cancelled = true;
     };
-  }, [deferredQuery, flowEdges, flowNodes, graph, largeGraphMode, mode, selectedId]);
+  }, [deferredQuery, graph, largeGraphMode, mode, selectedId]);
+
+  const graphIndex = useMemo(() => buildGraphIndex(graph), [graph]);
+  const selectedNode = selectedId ? graphIndex.nodeById.get(selectedId) ?? null : null;
+  const selectedEdges = selectedId ? graphIndex.relationshipsByNode.get(selectedId) ?? [] : [];
+  const graphWorkPending = loading || isPending || layoutStatus === "pending" || query !== deferredQuery;
+  const visibleNodeCount = scene?.nodes.length ?? 0;
+  const visibleEdgeCount = scene?.edges.length ?? 0;
+
+  const flowEdges = useMemo<VisualEdge[]>(() => {
+    if (!scene) {
+      return [];
+    }
+    const showEdgeLabels = scene.edges.length <= HIDE_LABEL_EDGE_THRESHOLD;
+    return scene.edges.map((edge) => ({
+      id: edge.id,
+      type: "visual",
+      source: edge.source,
+      target: edge.target,
+      label: showEdgeLabels ? edge.label : undefined,
+      animated: edge.confidence === "inferred" && !scene.graphIsLarge,
+      data: { graphEdge: edge, showLabel: showEdgeLabels },
+    }));
+  }, [scene]);
+
+  const flowNodes = useMemo<VisualNode[]>(
+    () =>
+      (scene?.nodes ?? []).map((node) => ({
+        id: node.id,
+        type: "visual",
+        position: { x: node.x, y: node.y },
+        data: {
+          label: node.label,
+          kind: node.kind,
+          badges: node.badges,
+          route: node.route,
+          file: node.file,
+          graphNode: node,
+          quiet: node.quiet,
+        },
+      })),
+    [scene?.nodes],
+  );
 
   const changeMode = (nextMode: Mode) => {
     startTransition(() => {
@@ -335,11 +281,11 @@ export default function VisualizerApp() {
     });
   };
 
-  const selectNode = (nodeId: string | null) => {
+  const selectNode = useCallback((nodeId: string | null) => {
     startTransition(() => {
       setSelectedId(nodeId);
     });
-  };
+  }, []);
 
   const showFullGraph = () => {
     startTransition(() => {
@@ -363,91 +309,13 @@ export default function VisualizerApp() {
   return (
     <ReactFlowProvider>
       <div className="flex min-h-screen flex-col bg-[#eef2f6] text-slate-950 lg:h-screen lg:flex-row lg:overflow-hidden">
-        <aside className="flex w-full shrink-0 flex-col border-b border-slate-200 bg-[#fbfcfe] lg:h-screen lg:w-[304px] lg:border-b-0 lg:border-r">
-          <div className="border-b border-slate-200 p-5">
-            <div className="flex items-center gap-3">
-              <div className="grid size-10 place-items-center rounded-md bg-slate-950 text-white">
-                <Braces size={19} />
-              </div>
-              <div>
-                <h1 className="text-base font-semibold tracking-normal">Route Atlas</h1>
-                <p className="mt-0.5 text-xs text-slate-500">Reusable Next.js map</p>
-              </div>
-            </div>
-          </div>
-
-          <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4 pb-8">
-            <label className="block">
-              <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Search</span>
-              <span className="flex h-10 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 shadow-sm focus-within:border-slate-400">
-                <Search size={16} className="text-slate-500" />
-                <input
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  className="min-w-0 flex-1 bg-transparent text-sm outline-none"
-                  placeholder="Route, file, package"
-                />
-              </span>
-            </label>
-
-            <div>
-              <div className="mb-2 text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Map Mode</div>
-              <div className="grid gap-2">
-                {modeOptions.map((option) => {
-                  const Icon = option.icon;
-                  const active = mode === option.id;
-                  return (
-                    <button
-                      key={option.id}
-                      type="button"
-                      onClick={() => changeMode(option.id)}
-                      className={`flex h-10 items-center gap-2 rounded-md border px-3 text-left text-sm font-medium transition ${
-                        active
-                          ? "border-slate-950 bg-slate-950 text-white shadow-sm"
-                          : "border-slate-200 bg-white text-slate-700 hover:border-slate-400"
-                      }`}
-                    >
-                      <Icon size={16} />
-                      {option.label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {graph ? (
-              <>
-                <div className="grid grid-cols-2 gap-2 text-sm">
-                  <Metric label="Routes" value={graph.summary.routes} />
-                  <Metric label="Dynamic" value={graph.summary.dynamicRoutes} />
-                  <Metric label="Files" value={graph.summary.totalNodes} />
-                  <Metric label="Edges" value={graph.summary.totalEdges} />
-                </div>
-                <div className="rounded-md border border-slate-200 bg-white p-3 text-xs text-slate-600">
-                  <div className="font-semibold text-slate-800">Target</div>
-                  <div className="mt-1 break-words">{graph.summary.targetRoot}</div>
-                  <div className="mt-2 text-slate-400">{graph.summary.scanMode} scan</div>
-                </div>
-              </>
-            ) : null}
-
-            <Legend />
-
-            {graph?.warnings.length ? (
-              <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
-                <div className="mb-1 flex items-center gap-2 font-semibold">
-                  <AlertTriangle size={14} />
-                  Scanner warnings
-                </div>
-                <ul className="space-y-1">
-                  {graph.warnings.slice(0, 4).map((warning) => (
-                    <li key={warning}>{warning}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-          </div>
-        </aside>
+        <LeftRail
+          graph={graph}
+          mode={mode}
+          query={query}
+          onQueryChange={setQuery}
+          onModeChange={changeMode}
+        />
 
         <main className="flex min-w-0 flex-1 flex-col">
           <header className="flex min-h-16 shrink-0 items-center justify-between gap-3 border-b border-slate-200 bg-[#fbfcfe] px-4 py-3">
@@ -455,14 +323,15 @@ export default function VisualizerApp() {
               <div className="truncate text-sm font-semibold">{graph ? graph.repoRoot : "Scanning target project"}</div>
               <div className="text-xs text-slate-500">
                 {graph
-                  ? `${graph.framework.name} ${graph.framework.version} · ${visibleGraph.nodes.length} visible nodes · ${visibleGraph.edges.length} visible edges`
+                  ? `${graph.framework.name} ${graph.framework.version} · ${visibleNodeCount} visible nodes · ${visibleEdgeCount} visible edges`
                   : "Building the map"}
               </div>
-              {visibleGraph.hiddenNodeCount || visibleGraph.hiddenEdgeCount ? (
+              {scene?.hiddenNodeCount || scene?.hiddenEdgeCount ? (
                 <div className="mt-1 text-xs text-slate-400">
-                  {visibleGraph.hiddenNodeCount} deep nodes hidden · {visibleGraph.hiddenEdgeCount} edges hidden
+                  {scene.hiddenNodeCount} deep nodes hidden · {scene.hiddenEdgeCount} edges hidden
                 </div>
               ) : null}
+              {sceneError ? <div className="mt-1 text-xs text-amber-600">Layout fallback active: {sceneError}</div> : null}
             </div>
             <div className="flex items-center gap-2">
               <button
@@ -496,9 +365,11 @@ export default function VisualizerApp() {
                   {error}
                 </div>
               </div>
+            ) : scene?.renderWithCanvas ? (
+              <CanvasGraph scene={scene} selectedId={selectedId} onSelect={selectNode} onTelemetry={setTelemetry} />
             ) : (
               <ReactFlow
-                nodes={laidOutNodes}
+                nodes={flowNodes}
                 edges={flowEdges}
                 nodeTypes={nodeTypes}
                 edgeTypes={edgeTypes}
@@ -508,11 +379,11 @@ export default function VisualizerApp() {
                 maxZoom={1.8}
                 onNodeClick={(_, node) => selectNode(node.id)}
                 onPaneClick={() => selectNode(null)}
-                onlyRenderVisibleElements
+                onlyRenderVisibleElements={Boolean(scene?.graphIsLarge)}
                 proOptions={{ hideAttribution: true }}
               >
                 <Background color="#cbd5e1" gap={20} />
-                {showMiniMap ? (
+                {scene && scene.nodes.length <= HIDE_MINIMAP_NODE_THRESHOLD ? (
                   <MiniMap
                     pannable
                     zoomable
@@ -523,11 +394,11 @@ export default function VisualizerApp() {
                 <Controls />
               </ReactFlow>
             )}
-            {mode === "all" && largeGraphMode === "guarded" && graph && !error ? (
+            {mode === "all" && largeGraphMode === "guarded" && graph && !error && scene ? (
               <div className="absolute left-4 top-4 max-w-sm rounded-md border border-slate-200 bg-white/95 p-3 text-xs text-slate-600 shadow-sm backdrop-blur">
                 <div className="font-semibold text-slate-900">Guarded All</div>
                 <div className="mt-1">
-                  Showing architecture relationships first. {visibleGraph.hiddenNodeCount} deep nodes and {visibleGraph.hiddenEdgeCount} edges are hidden.
+                  Showing architecture relationships first. {scene.hiddenNodeCount} deep nodes and {scene.hiddenEdgeCount} edges are hidden.
                 </div>
                 <button
                   type="button"
@@ -536,6 +407,14 @@ export default function VisualizerApp() {
                 >
                   Show full deep graph
                 </button>
+              </div>
+            ) : null}
+            {process.env.NODE_ENV === "development" && scene ? (
+              <div className="absolute bottom-4 right-4 rounded-md border border-slate-200 bg-white/90 px-3 py-2 text-[11px] text-slate-500 shadow-sm backdrop-blur">
+                <div className="font-semibold text-slate-800">Performance</div>
+                <div>scene {scene.timings.totalMs.toFixed(0)}ms · layout {scene.timings.layoutMs.toFixed(0)}ms</div>
+                <div>draw {telemetry.drawMs.toFixed(1)}ms · {telemetry.visibleNodes} nodes · {telemetry.visibleEdges} edges</div>
+                {scene.usedFastLayout ? <div>fast layout</div> : null}
               </div>
             ) : null}
             {graphWorkPending && !error ? (
@@ -549,26 +428,140 @@ export default function VisualizerApp() {
           </section>
         </main>
 
-        <aside className="flex w-full shrink-0 flex-col border-t border-slate-200 bg-[#fbfcfe] lg:h-screen lg:w-[360px] lg:border-l lg:border-t-0">
-          <div className="border-b border-slate-200 p-4">
-            <div className="flex items-center gap-2 text-sm font-semibold">
-              <FileCode2 size={17} />
-              Inspector
-            </div>
-          </div>
-          <div className="min-h-0 flex-1 overflow-auto p-4">
-            {selectedNode ? (
-              <Inspector node={selectedNode} edges={selectedEdges} nodeById={graphIndex.nodeById} />
-            ) : (
-              <div className="space-y-3 text-sm leading-6 text-slate-500">
-                <p>Select a route to unfold its components, imports, data calls, metadata, and params.</p>
-                <p>Route Story keeps the map readable first; All mode shows every discovered relationship.</p>
-              </div>
-            )}
-          </div>
-        </aside>
+        <RightInspector selectedNode={selectedNode} selectedEdges={selectedEdges} nodeById={graphIndex.nodeById} />
       </div>
     </ReactFlowProvider>
+  );
+}
+
+function LeftRail({
+  graph,
+  mode,
+  query,
+  onQueryChange,
+  onModeChange,
+}: {
+  graph: ScanGraph | null;
+  mode: Mode;
+  query: string;
+  onQueryChange: (query: string) => void;
+  onModeChange: (mode: Mode) => void;
+}) {
+  return (
+    <aside className="flex w-full shrink-0 flex-col border-b border-slate-200 bg-[#fbfcfe] lg:h-screen lg:w-[304px] lg:border-b-0 lg:border-r">
+      <div className="border-b border-slate-200 p-5">
+        <div className="flex items-center gap-3">
+          <div className="grid size-10 place-items-center rounded-md bg-slate-950 text-white">
+            <Braces size={19} />
+          </div>
+          <div>
+            <h1 className="text-base font-semibold tracking-normal">Route Atlas</h1>
+            <p className="mt-0.5 text-xs text-slate-500">Reusable Next.js map</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4 pb-8">
+        <label className="block">
+          <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Search</span>
+          <span className="flex h-10 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 shadow-sm focus-within:border-slate-400">
+            <Search size={16} className="text-slate-500" />
+            <input
+              value={query}
+              onChange={(event) => onQueryChange(event.target.value)}
+              className="min-w-0 flex-1 bg-transparent text-sm outline-none"
+              placeholder="Route, file, package"
+            />
+          </span>
+        </label>
+
+        <div>
+          <div className="mb-2 text-xs font-semibold uppercase tracking-[0.08em] text-slate-500">Map Mode</div>
+          <div className="grid gap-2">
+            {modeOptions.map((option) => {
+              const Icon = option.icon;
+              const active = mode === option.id;
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => onModeChange(option.id)}
+                  className={`flex h-10 items-center gap-2 rounded-md border px-3 text-left text-sm font-medium transition ${
+                    active ? "border-slate-950 bg-slate-950 text-white shadow-sm" : "border-slate-200 bg-white text-slate-700 hover:border-slate-400"
+                  }`}
+                >
+                  <Icon size={16} />
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {graph ? (
+          <>
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              <Metric label="Routes" value={graph.summary.routes} />
+              <Metric label="Dynamic" value={graph.summary.dynamicRoutes} />
+              <Metric label="Files" value={graph.summary.totalNodes} />
+              <Metric label="Edges" value={graph.summary.totalEdges} />
+            </div>
+            <div className="rounded-md border border-slate-200 bg-white p-3 text-xs text-slate-600">
+              <div className="font-semibold text-slate-800">Target</div>
+              <div className="mt-1 break-words">{graph.summary.targetRoot}</div>
+              <div className="mt-2 text-slate-400">{graph.summary.scanMode} scan</div>
+            </div>
+          </>
+        ) : null}
+
+        <Legend />
+
+        {graph?.warnings.length ? (
+          <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
+            <div className="mb-1 flex items-center gap-2 font-semibold">
+              <AlertTriangle size={14} />
+              Scanner warnings
+            </div>
+            <ul className="space-y-1">
+              {graph.warnings.slice(0, 4).map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
+    </aside>
+  );
+}
+
+function RightInspector({
+  selectedNode,
+  selectedEdges,
+  nodeById,
+}: {
+  selectedNode: GraphNode | null;
+  selectedEdges: GraphEdge[];
+  nodeById: Map<string, GraphNode>;
+}) {
+  return (
+    <aside className="flex w-full shrink-0 flex-col border-t border-slate-200 bg-[#fbfcfe] lg:h-screen lg:w-[360px] lg:border-l lg:border-t-0">
+      <div className="border-b border-slate-200 p-4">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <FileCode2 size={17} />
+          Inspector
+        </div>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto p-4">
+        {selectedNode ? (
+          <Inspector node={selectedNode} edges={selectedEdges} nodeById={nodeById} />
+        ) : (
+          <div className="space-y-3 text-sm leading-6 text-slate-500">
+            <p>Select a route to unfold its components, imports, data calls, metadata, and params.</p>
+            <p>Route Story keeps the map readable first; All mode shows every discovered relationship.</p>
+          </div>
+        )}
+      </div>
+    </aside>
   );
 }
 
@@ -592,120 +585,12 @@ function buildGraphIndex(graph: ScanGraph | null): GraphIndex {
   return { nodeById, relationshipsByNode };
 }
 
-function deriveVisibleGraph(
-  graph: ScanGraph | null,
-  mode: Mode,
-  query: string,
-  selectedId: string | null,
-  largeGraphMode: LargeGraphMode,
-) {
-  if (!graph) {
-    return { nodes: [] as GraphNode[], edges: [] as GraphEdge[], quietNodeIds: new Set<string>(), hiddenNodeCount: 0, hiddenEdgeCount: 0 };
-  }
-
-  const normalizedQuery = query.trim().toLowerCase();
-  const selectedNeighborhood = new Set<string>(selectedId ? [selectedId] : []);
-  const expansionEdges = selectedId
-    ? graph.edges.filter((edge) => expansionEdgeKinds.has(edge.kind) && (edge.source === selectedId || edge.target === selectedId))
-    : [];
-  for (const edge of expansionEdges) {
-    selectedNeighborhood.add(edge.source);
-    selectedNeighborhood.add(edge.target);
-  }
-
-  let candidateEdges: GraphEdge[];
-  if (mode === "story") {
-    candidateEdges = graph.edges.filter((edge) => storyEdgeKinds.has(edge.kind) || expansionEdges.includes(edge));
-  } else if (mode === "all" && largeGraphMode === "guarded") {
-    candidateEdges = graph.edges.filter((edge) => allGuardedEdgeKinds.has(edge.kind) || expansionEdges.includes(edge));
-  } else if (mode === "all") {
-    candidateEdges = graph.edges;
-  } else {
-    const edgeKinds = edgeKindsByMode[mode];
-    candidateEdges = graph.edges.filter((edge) => edgeKinds.has(edge.kind));
-  }
-
-  const connectedNodeIds = new Set<string>();
-  for (const edge of candidateEdges) {
-    connectedNodeIds.add(edge.source);
-    connectedNodeIds.add(edge.target);
-  }
-
-  const inMode = (node: GraphNode) => {
-    if (mode === "story") {
-      return routeNodeKinds.has(node.kind) || selectedNeighborhood.has(node.id) || connectedNodeIds.has(node.id);
-    }
-    if (mode === "routes") {
-      return routeNodeKinds.has(node.kind) || connectedNodeIds.has(node.id);
-    }
-    if (mode === "components") {
-      return ["route", "page", "layout", "component", "utility", "external", "asset"].includes(node.kind) || connectedNodeIds.has(node.id);
-    }
-    if (mode === "data") {
-      return ["route", "page", "layout", "data", "param", "metadata"].includes(node.kind) || connectedNodeIds.has(node.id);
-    }
-    if (mode === "navigation") {
-      return routeNodeKinds.has(node.kind) || connectedNodeIds.has(node.id);
-    }
-    if (mode === "all" && largeGraphMode === "guarded") {
-      return routeNodeKinds.has(node.kind) || selectedNeighborhood.has(node.id) || connectedNodeIds.has(node.id);
-    }
-    return true;
-  };
-
-  const nodes = graph.nodes.filter((node) => {
-    if (!inMode(node)) {
-      return false;
-    }
-    if (!normalizedQuery) {
-      return true;
-    }
-    return [node.label, node.route, node.file, node.kind, node.specialFile]
-      .filter(Boolean)
-      .some((value) => String(value).toLowerCase().includes(normalizedQuery));
-  });
-
-  const nodeIds = new Set(nodes.map((node) => node.id));
-  const edges = candidateEdges.filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target));
-  const quietNodeIds = new Set<string>();
-  if (mode === "story" || (mode === "all" && largeGraphMode === "guarded")) {
-    for (const node of nodes) {
-      if (!routeNodeKinds.has(node.kind) && !selectedNeighborhood.has(node.id)) {
-        quietNodeIds.add(node.id);
-      }
-    }
-  }
-
-  let hiddenNodeCount = 0;
-  let hiddenEdgeCount = 0;
-  if (mode === "all" && largeGraphMode === "guarded") {
-    const fullNodes = graph.nodes.filter((node) => matchesQuery(node, normalizedQuery));
-    const fullNodeIds = new Set(fullNodes.map((node) => node.id));
-    const fullEdges = graph.edges.filter((edge) => fullNodeIds.has(edge.source) && fullNodeIds.has(edge.target));
-    hiddenNodeCount = Math.max(0, fullNodes.length - nodes.length);
-    hiddenEdgeCount = Math.max(0, fullEdges.length - edges.length);
-  }
-
-  return { nodes, edges, quietNodeIds, hiddenNodeCount, hiddenEdgeCount };
-}
-
-function matchesQuery(node: GraphNode, normalizedQuery: string) {
-  if (!normalizedQuery) {
-    return true;
-  }
-  return [node.label, node.route, node.file, node.kind, node.specialFile]
-    .filter(Boolean)
-    .some((value) => String(value).toLowerCase().includes(normalizedQuery));
-}
-
 function IdeNode({ data, selected }: NodeProps<VisualNode>) {
   const palette = nodePalette[data.kind];
   const isRoute = data.kind === "route";
   return (
     <div
-      className={`relative rounded-md border bg-white shadow-[0_10px_28px_rgba(15,23,42,0.08)] transition ${
-        data.quiet ? "opacity-55" : "opacity-100"
-      }`}
+      className={`relative rounded-md border bg-white shadow-[0_10px_28px_rgba(15,23,42,0.08)] transition ${data.quiet ? "opacity-55" : "opacity-100"}`}
       style={{
         width: isRoute ? 240 : 188,
         borderColor: selected ? palette.border : "#dbe3ed",
@@ -824,7 +709,7 @@ function Inspector({ node, edges, nodeById }: { node: GraphNode; edges: GraphEdg
     <div className="space-y-5">
       <section>
         <div className="mb-2 flex flex-wrap gap-1.5">
-          {getBadges(node).map((badge) => (
+          {getGraphNodeBadges(node).map((badge) => (
             <span key={badge} className="rounded-sm bg-slate-100 px-2 py-1 text-[11px] font-semibold text-slate-700">
               {badge}
             </span>
@@ -963,42 +848,4 @@ function Detail({ label, value }: { label: string; value?: string }) {
       <div className="break-words rounded-md border border-slate-200 bg-white p-2 text-xs text-slate-700 shadow-sm">{value}</div>
     </div>
   );
-}
-
-function getBadges(node: GraphNode) {
-  const badges: string[] = [node.kind];
-  if (node.dynamic) {
-    badges.push("dynamic");
-  }
-  if (node.specialFile) {
-    badges.push(node.specialFile);
-  }
-  if (String(node.segment ?? "").startsWith("[[...")) {
-    badges.push("optional catch-all");
-  } else if (String(node.segment ?? "").startsWith("[...")) {
-    badges.push("catch-all");
-  }
-  const metadata = node.metadata;
-  if (metadata.clientComponent) {
-    badges.push("client");
-  }
-  if (metadata.serverDirective) {
-    badges.push("server");
-  }
-  if (metadata.usesFetch) {
-    badges.push("fetch");
-  }
-  if (metadata.generateStaticParams) {
-    badges.push("static params");
-  }
-  if (metadata.generateMetadata) {
-    badges.push("metadata");
-  }
-  if (Array.isArray(metadata.slots) && metadata.slots.length) {
-    badges.push("slot");
-  }
-  if (Array.isArray(metadata.intercepted) && metadata.intercepted.length) {
-    badges.push("intercepted");
-  }
-  return [...new Set(badges)];
 }
