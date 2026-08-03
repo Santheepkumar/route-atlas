@@ -80,6 +80,7 @@ const modeOptions: Array<{ id: Mode; label: string; icon: typeof Route }> = [
 
 const HIDE_LABEL_EDGE_THRESHOLD = 180;
 const HIDE_MINIMAP_NODE_THRESHOLD = 260;
+const ENABLE_SCENE_WORKER = false;
 
 const nodePalette: Record<GraphNodeKind, { fill: string; border: string; text: string; chip: string }> = {
   route: { fill: "#f8fafc", border: "#0f172a", text: "#0f172a", chip: "#e2e8f0" },
@@ -136,20 +137,34 @@ export default function VisualizerApp() {
   const [telemetry, setTelemetry] = useState({ renderCount: 0, visibleNodes: 0, visibleEdges: 0, drawMs: 0 });
   const deferredQuery = useDeferredValue(query);
   const workerRef = useRef<Worker | null>(null);
+  const workerFailedRef = useRef(false);
   const latestJobId = useRef(0);
+  const completedJobId = useRef(0);
 
   useEffect(() => {
+    if (!ENABLE_SCENE_WORKER) {
+      workerFailedRef.current = true;
+      return;
+    }
+
     try {
-      workerRef.current = new Worker(new URL("./scene-worker.ts", import.meta.url), { type: "module" });
+      workerRef.current = new Worker(new URL("./scene-worker.ts", import.meta.url));
       workerRef.current.onmessage = (event: MessageEvent<WorkerResult>) => {
         if (event.data.id !== latestJobId.current) {
           return;
         }
+        completedJobId.current = event.data.id;
         setScene(event.data.scene);
         setSceneError(event.data.error ?? null);
         setLayoutStatus(event.data.status === "ready" ? "ready" : "failed");
       };
+      workerRef.current.onerror = () => {
+        workerFailedRef.current = true;
+        workerRef.current?.terminate();
+        workerRef.current = null;
+      };
     } catch {
+      workerFailedRef.current = true;
       workerRef.current = null;
     }
     return () => workerRef.current?.terminate();
@@ -189,7 +204,7 @@ export default function VisualizerApp() {
   }, [graph]);
 
   useEffect(() => {
-    const worker = workerRef.current;
+    const worker = workerFailedRef.current ? null : workerRef.current;
     const job: WorkerJob = {
       id: latestJobId.current + 1,
       graph: worker ? null : graph,
@@ -208,7 +223,29 @@ export default function VisualizerApp() {
 
     if (worker) {
       worker.postMessage({ type: "derive", job } satisfies SceneWorkerRequest);
-      return;
+      const fallbackTimer = window.setTimeout(() => {
+        if (latestJobId.current !== job.id || completedJobId.current === job.id || !graph) {
+          return;
+        }
+        workerFailedRef.current = true;
+        worker.terminate();
+        workerRef.current = null;
+        void deriveSceneGraph({ ...job, graph })
+          .then((nextScene) => {
+            if (latestJobId.current === job.id) {
+              setScene(nextScene);
+              setSceneError("Worker layout timed out; using main-thread fallback.");
+              setLayoutStatus("ready");
+            }
+          })
+          .catch((layoutError) => {
+            if (latestJobId.current === job.id) {
+              setSceneError(layoutError instanceof Error ? layoutError.message : "Scene layout failed.");
+              setLayoutStatus("failed");
+            }
+          });
+      }, 4500);
+      return () => window.clearTimeout(fallbackTimer);
     }
 
     let cancelled = false;
