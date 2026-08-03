@@ -54,6 +54,7 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const viewportRef = useRef<SceneViewport>({ x: 0, y: 0, zoom: 1, width: 0, height: 0 });
   const dragRef = useRef<{ pointerId: number; x: number; y: number; viewportX: number; viewportY: number; moved: boolean } | null>(null);
+  const drawRef = useRef<() => void>(() => {});
   const renderCountRef = useRef(0);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const nodeById = useMemo(() => new Map(scene.nodes.map((node) => [node.id, node])), [scene.nodes]);
@@ -130,6 +131,10 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
   }, [hoveredId, onTelemetry, scene, selectedId]);
 
   useEffect(() => {
+    drawRef.current = draw;
+  }, [draw]);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) {
       return;
@@ -137,13 +142,13 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
     const resize = () => {
       fitScene(canvas, scene, viewportRef);
       onViewportChange?.(viewportRef.current);
-      window.requestAnimationFrame(draw);
+      window.requestAnimationFrame(() => drawRef.current());
     };
     resize();
     const observer = new ResizeObserver(resize);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [draw, onViewportChange, scene]);
+  }, [onViewportChange, scene]);
 
   useEffect(() => {
     const frame = window.requestAnimationFrame(draw);
