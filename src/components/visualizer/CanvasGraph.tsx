@@ -50,6 +50,7 @@ const edgePalette: Record<GraphEdgeKind, string> = {
 };
 
 export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onTelemetry }: CanvasGraphProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const viewportRef = useRef<SceneViewport>({ x: 0, y: 0, zoom: 1, width: 0, height: 0 });
   const dragRef = useRef<{ pointerId: number; x: number; y: number; viewportX: number; viewportY: number; moved: boolean } | null>(null);
@@ -158,6 +159,46 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
     [draw, onViewportChange],
   );
 
+  const zoomAtPoint = useCallback(
+    (clientX: number, clientY: number, deltaY: number) => {
+      const canvas = canvasRef.current;
+      const rect = canvas?.getBoundingClientRect();
+      if (!rect) {
+        return;
+      }
+      const viewport = viewportRef.current;
+      const zoomFactor = Math.exp(-deltaY * 0.0012);
+      const nextZoom = clamp(viewport.zoom * zoomFactor, 0.06, 2);
+      const mouseX = clientX - rect.left;
+      const mouseY = clientY - rect.top;
+      const worldX = viewport.x + mouseX / viewport.zoom;
+      const worldY = viewport.y + mouseY / viewport.zoom;
+      updateViewport({
+        ...viewport,
+        zoom: nextZoom,
+        x: worldX - mouseX / nextZoom,
+        y: worldY - mouseY / nextZoom,
+      });
+    },
+    [updateViewport],
+  );
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return;
+    }
+
+    const handleWheel = (event: WheelEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+      zoomAtPoint(event.clientX, event.clientY, event.deltaY);
+    };
+
+    container.addEventListener("wheel", handleWheel, { passive: false });
+    return () => container.removeEventListener("wheel", handleWheel);
+  }, [zoomAtPoint]);
+
   const screenToWorld = useCallback((clientX: number, clientY: number) => {
     const canvas = canvasRef.current;
     const rect = canvas?.getBoundingClientRect();
@@ -172,7 +213,13 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
   }, []);
 
   return (
-    <div className="relative h-full w-full" role="application" aria-label="Route Atlas large canvas">
+    <div
+      ref={containerRef}
+      className="relative h-full w-full overscroll-contain"
+      role="application"
+      aria-label="Route Atlas large canvas"
+      style={{ touchAction: "none" }}
+    >
       <canvas
         ref={canvasRef}
         className="h-full w-full cursor-grab outline-none active:cursor-grabbing"
@@ -213,27 +260,6 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
         onPointerLeave={() => {
           dragRef.current = null;
           setHoveredId(null);
-        }}
-        onWheel={(event) => {
-          event.preventDefault();
-          const canvas = canvasRef.current;
-          const rect = canvas?.getBoundingClientRect();
-          if (!rect) {
-            return;
-          }
-          const viewport = viewportRef.current;
-          const zoomFactor = Math.exp(-event.deltaY * 0.0012);
-          const nextZoom = clamp(viewport.zoom * zoomFactor, 0.06, 2);
-          const mouseX = event.clientX - rect.left;
-          const mouseY = event.clientY - rect.top;
-          const worldX = viewport.x + mouseX / viewport.zoom;
-          const worldY = viewport.y + mouseY / viewport.zoom;
-          updateViewport({
-            ...viewport,
-            zoom: nextZoom,
-            x: worldX - mouseX / nextZoom,
-            y: worldY - mouseY / nextZoom,
-          });
         }}
       />
       <CanvasControls
