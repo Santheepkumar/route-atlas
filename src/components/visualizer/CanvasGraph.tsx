@@ -49,6 +49,10 @@ const edgePalette: Record<GraphEdgeKind, string> = {
   "dynamic-param": "#0e7490",
 };
 
+const WHEEL_ZOOM_SENSITIVITY = 0.0024;
+const BUTTON_ZOOM_IN_FACTOR = 1.35;
+const BUTTON_ZOOM_OUT_FACTOR = 1 / BUTTON_ZOOM_IN_FACTOR;
+
 export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onTelemetry }: CanvasGraphProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -172,7 +176,7 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
         return;
       }
       const viewport = viewportRef.current;
-      const zoomFactor = Math.exp(-deltaY * 0.0012);
+      const zoomFactor = Math.exp(-deltaY * WHEEL_ZOOM_SENSITIVITY);
       const nextZoom = clamp(viewport.zoom * zoomFactor, 0.06, 2);
       const mouseX = clientX - rect.left;
       const mouseY = clientY - rect.top;
@@ -197,7 +201,7 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
     const handleWheel = (event: WheelEvent) => {
       event.preventDefault();
       event.stopPropagation();
-      zoomAtPoint(event.clientX, event.clientY, event.deltaY);
+      zoomAtPoint(event.clientX, event.clientY, normalizeWheelDelta(event));
     };
 
     container.addEventListener("wheel", handleWheel, { passive: false });
@@ -268,8 +272,8 @@ export function CanvasGraph({ scene, selectedId, onSelect, onViewportChange, onT
         }}
       />
       <CanvasControls
-        onZoomIn={() => zoomCanvas(canvasRef, viewportRef, updateViewport, 1.25)}
-        onZoomOut={() => zoomCanvas(canvasRef, viewportRef, updateViewport, 0.8)}
+        onZoomIn={() => zoomCanvas(canvasRef, viewportRef, updateViewport, BUTTON_ZOOM_IN_FACTOR)}
+        onZoomOut={() => zoomCanvas(canvasRef, viewportRef, updateViewport, BUTTON_ZOOM_OUT_FACTOR)}
         onFit={() => {
           const canvas = canvasRef.current;
           if (!canvas) {
@@ -461,6 +465,16 @@ function zoomCanvas(
     x: worldX - centerX / nextZoom,
     y: worldY - centerY / nextZoom,
   });
+}
+
+function normalizeWheelDelta(event: WheelEvent) {
+  if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+    return event.deltaY * 16;
+  }
+  if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+    return event.deltaY * 600;
+  }
+  return event.deltaY;
 }
 
 function SelectedNodeBadge({ node }: { node?: SceneNode }) {

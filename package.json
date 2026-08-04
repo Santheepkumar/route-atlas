@@ -1,6 +1,6 @@
 {
   "name": "route-atlas",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "private": false,
   "description": "Local Next.js App Router atlas for routes, layouts, components, navigation, and data flow.",
   "repository": {
